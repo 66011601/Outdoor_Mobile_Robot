@@ -1,0 +1,5 @@
+Task 
+- Integrate mapviz with osm_mapviz
+- Research 2D Lidar with Dept camera for filter small segment out
+- Remove save button -> save after generate
+- Check after stop if robot can continue moving

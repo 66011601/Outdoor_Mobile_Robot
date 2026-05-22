@@ -1,0 +1,73 @@
+route:
+  # -----------------------------------------------------------------------
+  # Start and end GPS coordinates for the route
+  # Replace these with your actual target location coordinates
+  # -----------------------------------------------------------------------
+  # start:
+  #   latitude: 12.72000376182906
+  #   longitude: 101.1560469421637
+
+  # end:
+  #   latitude: 12.714566099551156
+  #   longitude: 101.1550663232872
+
+  # -----------------------------------------------------------------------
+  # OSM network type:
+  #   walk  - pedestrian paths, sidewalks, footways (use for real deployment)
+  #   bike  - cycling paths (also allows pedestrian paths)
+  #   all   - all standard road types (streets, residential, service, etc.)
+  #
+  # NOTE: 'raceway' highway type is excluded from ALL standard network types.
+  # Use custom_filter below for Sonoma Raceway simulation.
+  # -----------------------------------------------------------------------
+  network_type: walk
+
+  # -----------------------------------------------------------------------
+  # custom_filter: Overpass QL filter to select specific OSM highway types.
+  # When set, this overrides network_type completely.
+  #
+  # Leave empty for real deployment (uses network_type above).
+  #
+  # For Sonoma Raceway simulation:
+  #   custom_filter: '["highway"~"raceway"]'
+  #
+  # For simulation + surrounding service roads:
+  #   custom_filter: '["highway"~"raceway|service"]'
+  # -----------------------------------------------------------------------
+  # custom_filter: '["highway"~"raceway"]'
+
+  # -----------------------------------------------------------------------
+  # Bounding box buffer around start→end in meters.
+  # Increase if osmnx fails to find a path (sparse OSM data).
+  # -----------------------------------------------------------------------
+  buffer_m: 500.0
+
+  # -----------------------------------------------------------------------
+  # Maximum spacing between consecutive waypoints in meters.
+  # Smaller = robot tracks the route more tightly (smoother path).
+  # 5.0m is a good starting point with NEO-M8N GPS.
+  # -----------------------------------------------------------------------
+  max_gap_m: 5.0
+
+  # -----------------------------------------------------------------------
+  # Lateral offset from the OSM route centerline.
+  # Positive value shifts the entire route sideways so the robot travels
+  # parallel to the street at that distance.
+  #
+  # lateral_offset_m: how far to shift in meters (0 = follow OSM centerline)
+  # offset_side: 'right' or 'left' relative to direction of travel
+  #
+  # How to determine which side:
+  #   1. Set lateral_offset_m: 0, run generator, run robot once to see the route direction.
+  #   2. If the street is on your right as you travel, use offset_side: left to move away.
+  #   3. Increase lateral_offset_m until the robot is comfortably on the grass.
+  #
+  # With NEO-M8N GPS (~2-3m error), keep lateral_offset_m >= 4.0 for safety margin.
+  # -----------------------------------------------------------------------
+  lateral_offset_m: 0.0
+  offset_side: right
+
+  # -----------------------------------------------------------------------
+  # Output file path. Leave empty to overwrite config/demo_waypoints.yaml.
+  # -----------------------------------------------------------------------
+  output_file: ""
