@@ -2,9 +2,10 @@
 route_waypoint_follower.py
 
 Reads GPS waypoints from waypoints.yaml and follows them one by one.
-Listens to /tmp/dcvg_nav_cmd for pause / stop commands written by osm_route_app.
+Reads stop points from stops.yaml (same directory) — robot waits at each
+stop until a confirmation message arrives on the configured topic.
 
-Commands written to the file:
+Commands written to /tmp/dcvg_nav_cmd:
   run   — navigate normally
   pause — cancel current goal and wait in place
   stop  — cancel and exit
@@ -12,6 +13,9 @@ Commands written to the file:
 Usage:
   ros2 run dcvg_robot route_waypoint_follower
   ros2 run dcvg_robot route_waypoint_follower /path/to/waypoints.yaml
+
+To confirm a stop from the terminal (first draft):
+  ros2 topic pub --once /dcvg/stop_confirm std_msgs/msg/String "data: 'go'"
 """
 
 import os
@@ -24,10 +28,13 @@ from geometry_msgs.msg import PoseStamped
 from nav2_simple_commander.robot_navigator import BasicNavigator
 from rclpy.node import Node
 from robot_localization.srv import FromLL
+from std_msgs.msg import String
 
 from nav2_gps_waypoint_follower_demo.utils.gps_utils import quaternion_from_euler
 
-_NAV_CMD_FILE = '/tmp/dcvg_nav_cmd'
+_NAV_CMD_FILE      = '/tmp/dcvg_nav_cmd'
+_STOP_STATUS_FILE  = '/tmp/dcvg_stop_status'
+_STOP_CONFIRM_FILE = '/tmp/dcvg_stop_confirm'
 
 
 def _read_cmd():
@@ -43,6 +50,24 @@ def _write_cmd(cmd):
         f.write(cmd)
 
 
+def _write_stop_status(msg: str):
+    with open(_STOP_STATUS_FILE, 'w') as f:
+        f.write(msg)
+
+
+def _check_file_confirm() -> bool:
+    """Return True if the web app wrote a confirm signal, and clear it."""
+    try:
+        with open(_STOP_CONFIRM_FILE) as f:
+            val = f.read().strip()
+        if val == 'confirm':
+            os.remove(_STOP_CONFIRM_FILE)
+            return True
+    except FileNotFoundError:
+        pass
+    return False
+
+
 class RouteWaypointFollower(Node):
 
     def __init__(self, wps_file_path):
@@ -55,15 +80,45 @@ class RouteWaypointFollower(Node):
         self.waypoints = data['waypoints']
         self.get_logger().info(f"Loaded {len(self.waypoints)} waypoints from {wps_file_path}")
 
+        # --- Load stops configuration ---
+        self.stops = {}            # {waypoint_index: {index, latitude, longitude}}
+        self.confirmation_topic = '/dcvg/stop_confirm'
+        self.reached_topic      = '/dcvg/stop_reached'
+        self._stop_confirmed    = False
+
+        stops_file = os.path.join(os.path.dirname(wps_file_path), 'stops.yaml')
+        if os.path.exists(stops_file):
+            with open(stops_file) as f:
+                sd = yaml.safe_load(f) or {}
+            self.confirmation_topic = sd.get('confirmation_topic', self.confirmation_topic)
+            self.reached_topic      = sd.get('reached_topic',      self.reached_topic)
+            for s in sd.get('stops', []):
+                self.stops[int(s['index'])] = s
+            self.get_logger().info(
+                f"Loaded {len(self.stops)} stop(s) — "
+                f"confirm: '{self.confirmation_topic}', reached: '{self.reached_topic}'"
+            )
+        else:
+            self.get_logger().info("No stops.yaml found — no stop points configured")
+
+        if self.stops:
+            self._stop_pub = self.create_publisher(String, self.reached_topic, 10)
+            self._confirm_sub = self.create_subscription(
+                String, self.confirmation_topic, self._confirm_cb, 10)
+
+    def _confirm_cb(self, msg):
+        self.get_logger().info(f"Stop confirmation received: '{msg.data}'")
+        self._stop_confirmed = True
+
     def _convert_to_posestamped(self, lat, lon, yaw=0.0):
         if not self.from_ll_client.wait_for_service(timeout_sec=5.0):
             self.get_logger().error('/fromLL service not available — is navsat_transform_node running?')
             return None
 
         req = FromLL.Request()
-        req.ll_point.latitude = lat
+        req.ll_point.latitude  = lat
         req.ll_point.longitude = lon
-        req.ll_point.altitude = 0.0
+        req.ll_point.altitude  = 0.0
 
         future = self.from_ll_client.call_async(req)
         rclpy.spin_until_future_complete(self, future)
@@ -83,10 +138,51 @@ class RouteWaypointFollower(Node):
         pose.pose.orientation = quaternion_from_euler(0.0, 0.0, yaw)
         return pose
 
+    def _wait_at_stop(self, waypoint_idx):
+        """Publish stop-reached event and block until confirmation or stop command."""
+        sorted_keys = sorted(self.stops.keys())
+        stop_num = sorted_keys.index(waypoint_idx) + 1
+        s = self.stops[waypoint_idx]
+
+        text = (f"Stop{stop_num}, "
+                f"lat {float(s['latitude']):.6f}, "
+                f"long {float(s['longitude']):.6f}")
+
+        # Publish to ROS topic
+        ros_msg = String()
+        ros_msg.data = text
+        self._stop_pub.publish(ros_msg)
+
+        # Write status file so the web app can show the popup
+        _write_stop_status(text)
+        # Clear any stale confirm from a previous stop
+        _check_file_confirm()
+
+        self.get_logger().info(
+            f"★ Reached {text} — waiting for confirmation on '{self.confirmation_topic}'"
+        )
+
+        self._stop_confirmed = False
+        while not self._stop_confirmed:
+            cmd = _read_cmd()
+            if cmd == 'stop':
+                _write_stop_status('')
+                self.get_logger().info("Navigation stopped at stop point.")
+                return 'stop'
+            # Accept confirm from web app (file) OR ROS topic
+            if _check_file_confirm():
+                break
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        _write_stop_status('')
+        self.get_logger().info(f"★ Stop {stop_num} confirmed — continuing")
+        return 'continue'
+
     def start(self):
         self.navigator.waitUntilNav2Active(localizer='bt_navigator')
 
         self.get_logger().info("Converting GPS waypoints to map frame...")
+        # poses: list of (original_waypoint_index, PoseStamped)
         poses = []
         for i, wp in enumerate(self.waypoints):
             pose = self._convert_to_posestamped(
@@ -94,11 +190,12 @@ class RouteWaypointFollower(Node):
             if pose is None:
                 self.get_logger().warn(f"Skipping waypoint {i + 1} — conversion failed")
                 continue
-            poses.append(pose)
+            poses.append((i, pose))
             self.get_logger().info(
                 f"  [{i + 1:>3}/{len(self.waypoints)}] "
                 f"GPS ({wp['latitude']:.6f}, {wp['longitude']:.6f}) → "
                 f"map ({pose.pose.position.x:.1f}, {pose.pose.position.y:.1f})"
+                + (" [STOP]" if i in self.stops else "")
             )
 
         if not poses:
@@ -106,11 +203,14 @@ class RouteWaypointFollower(Node):
             return
 
         _write_cmd('run')
-        self.get_logger().info(f"Starting navigation: {len(poses)} waypoints")
+        self.get_logger().info(
+            f"Starting navigation: {len(poses)} waypoints, {len(self.stops)} stop(s)")
 
-        i = 0
-        while i < len(poses):
-            # --- Check command before starting each waypoint ---
+        j = 0
+        while j < len(poses):
+            orig_idx, pose = poses[j]
+
+            # --- Check command before each waypoint ---
             while True:
                 cmd = _read_cmd()
                 if cmd == 'stop':
@@ -119,10 +219,11 @@ class RouteWaypointFollower(Node):
                 if cmd == 'pause':
                     rclpy.spin_once(self, timeout_sec=0.2)
                     continue
-                break  # cmd == 'run'
+                break
 
-            self.get_logger().info(f"→ Waypoint {i + 1}/{len(poses)}")
-            self.navigator.goToPose(poses[i])
+            self.get_logger().info(f"→ Waypoint {j + 1}/{len(poses)}"
+                                   + (" [STOP ahead]" if orig_idx in self.stops else ""))
+            self.navigator.goToPose(pose)
 
             # --- Monitor until waypoint reached or command received ---
             while not self.navigator.isTaskComplete():
@@ -136,8 +237,7 @@ class RouteWaypointFollower(Node):
 
                 if cmd == 'pause':
                     self.navigator.cancelTask()
-                    self.get_logger().info(f"Paused at waypoint {i + 1}")
-                    # Wait until resumed or stopped
+                    self.get_logger().info(f"Paused at waypoint {j + 1}")
                     cmd = 'pause'
                     while cmd == 'pause':
                         rclpy.spin_once(self, timeout_sec=0.2)
@@ -145,13 +245,19 @@ class RouteWaypointFollower(Node):
                     if cmd == 'stop':
                         self.get_logger().info("Navigation stopped while paused.")
                         return
-                    # Resumed — re-issue the same goal
-                    self.get_logger().info(f"Resumed — re-navigating to waypoint {i + 1}")
-                    self.navigator.goToPose(poses[i])
+                    self.get_logger().info(f"Resumed — re-navigating to waypoint {j + 1}")
+                    self.navigator.goToPose(pose)
 
             result = self.navigator.getResult()
-            self.get_logger().info(f"Waypoint {i + 1}/{len(poses)} complete — result: {result}")
-            i += 1
+            self.get_logger().info(f"Waypoint {j + 1}/{len(poses)} complete — result: {result}")
+
+            # --- Stop point: wait for confirmation before advancing ---
+            if orig_idx in self.stops:
+                outcome = self._wait_at_stop(orig_idx)
+                if outcome == 'stop':
+                    return
+
+            j += 1
 
         self.get_logger().info("All waypoints reached!")
         _write_cmd('stopped')

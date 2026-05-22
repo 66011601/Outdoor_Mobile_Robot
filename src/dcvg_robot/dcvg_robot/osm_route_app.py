@@ -14,7 +14,9 @@ import threading
 import traceback
 import yaml
 
-_NAV_CMD_FILE = '/tmp/dcvg_nav_cmd'
+_NAV_CMD_FILE      = '/tmp/dcvg_nav_cmd'
+_STOP_STATUS_FILE  = '/tmp/dcvg_stop_status'
+_STOP_CONFIRM_FILE = '/tmp/dcvg_stop_confirm'
 _nav_proc = None
 _nav_state = 'stopped'  # 'stopped' | 'running' | 'paused'
 
@@ -204,6 +206,35 @@ def api_stops():
     return jsonify({'stops': stops})
 
 
+@app.route('/api/stops_config', methods=['GET', 'POST'])
+def api_stops_config():
+    if request.method == 'GET':
+        path = _find_config('stops.yaml')
+        if not path:
+            return jsonify({'confirmation_topic': '/dcvg/stop_confirm',
+                            'reached_topic': '/dcvg/stop_reached', 'stops': []})
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+        return jsonify({
+            'confirmation_topic': data.get('confirmation_topic', '/dcvg/stop_confirm'),
+            'reached_topic':      data.get('reached_topic',      '/dcvg/stop_reached'),
+            'stops': data.get('stops', [])
+        })
+    body = request.json or {}
+    data = {
+        'confirmation_topic': body.get('confirmation_topic', '/dcvg/stop_confirm'),
+        'reached_topic':      body.get('reached_topic',      '/dcvg/stop_reached'),
+        'stops': [{'index':     int(s['index']),
+                   'latitude':  round(float(s['latitude']),  8),
+                   'longitude': round(float(s['longitude']), 8)}
+                  for s in body.get('stops', [])]
+    }
+    saved = _save_yaml(data, 'stops.yaml')
+    if not saved:
+        return jsonify({'error': 'Could not save'}), 500
+    return jsonify({'status': 'ok', 'count': len(data['stops'])})
+
+
 @app.route('/api/nav/start', methods=['POST'])
 def api_nav_start():
     global _nav_proc, _nav_state
@@ -258,6 +289,23 @@ def api_nav_status():
 @app.route('/api/robot_pose')
 def api_robot_pose():
     return jsonify(_robot_pose)
+
+
+@app.route('/api/stop_status')
+def api_stop_status():
+    try:
+        with open(_STOP_STATUS_FILE) as f:
+            msg = f.read().strip()
+        return jsonify({'waiting': bool(msg), 'message': msg})
+    except FileNotFoundError:
+        return jsonify({'waiting': False, 'message': ''})
+
+
+@app.route('/api/stop_confirm', methods=['POST'])
+def api_stop_confirm():
+    with open(_STOP_CONFIRM_FILE, 'w') as f:
+        f.write('confirm')
+    return jsonify({'status': 'ok'})
 
 
 @app.route('/api/config')
@@ -368,6 +416,11 @@ body{font-family:system-ui,sans-serif;font-size:13px;display:flex;height:100vh;o
 .wp-dot{width:10px;height:10px;border-radius:50%;background:#2980b9;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.35);cursor:grab;transition:transform .1s}
 .wp-dot:hover{transform:scale(1.5);background:#1a6090}
 
+/* ── Stop points ── */
+.stop-item-ui{display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid #f2f2f2}
+.stop-diamond-sm{width:11px;height:11px;background:#c0392b;border:2px solid #fff;border-radius:2px;transform:rotate(45deg);flex-shrink:0;box-shadow:0 1px 3px rgba(0,0,0,.3)}
+#btn-add-stop.active{background:#27ae60 !important}
+
 /* ── Search ── */
 #search-wrap{display:flex;gap:6px;padding:10px 12px;border-bottom:1px solid #eee;background:#fafafa}
 #search-input{flex:1;padding:6px 9px;border:1px solid #ddd;border-radius:5px;font-size:12px;background:#fff}
@@ -471,6 +524,29 @@ body{font-family:system-ui,sans-serif;font-size:13px;display:flex;height:100vh;o
         <div id="wp-info">No waypoints yet.</div>
         <div class="hint">Drag <b style="color:#2980b9">●</b> to move &nbsp;·&nbsp; Right-click to remove &nbsp;·&nbsp; Click <span style="color:#2980b9">route line</span> to add</div>
       </div>
+      <div class="section">
+        <div class="sec-title">Stop Points &nbsp;<span id="stop-pts-count" style="color:#c0392b">0</span></div>
+        <div class="hint">Robot waits at each ◆ until it receives a confirmation message.</div>
+        <div class="row"><label>Interval (m)</label>
+          <input type="number" id="stop-interval" value="50" min="5" step="5"/>
+        </div>
+        <div class="btn-row" style="margin-bottom:8px">
+          <button class="btn btn-gray" onclick="autoGenStops()">↺ Auto-generate</button>
+          <button class="btn" id="btn-add-stop" onclick="toggleStopMode()" style="background:#8e44ad;color:#fff">+ Add Stop</button>
+        </div>
+        <div class="btn-row" style="margin-bottom:10px">
+          <button class="btn btn-gray" onclick="clearAllStops()">Clear Stops</button>
+          <button class="btn btn-gray" onclick="saveStopsConfig()">💾 Save Config</button>
+        </div>
+        <div class="sec-title">ROS Topics</div>
+        <div class="row"><label>Confirm on</label>
+          <input type="text" id="stop-confirm-topic" value="/dcvg/stop_confirm" style="font-family:monospace;font-size:10px"/>
+        </div>
+        <div class="row"><label>Reached on</label>
+          <input type="text" id="stop-reached-topic" value="/dcvg/stop_reached" style="font-family:monospace;font-size:10px"/>
+        </div>
+        <ul id="stops-list-ui" style="list-style:none;margin-top:8px"></ul>
+      </div>
     </div>
 
   </div><!-- sidebar-body -->
@@ -496,8 +572,10 @@ body{font-family:system-ui,sans-serif;font-size:13px;display:flex;height:100vh;o
 <div id="map">
   <div id="legend">
     <div class="leg"><div class="leg-line" style="background:#2980b9"></div> Generated route</div>
+    <div class="leg"><div style="width:11px;height:11px;background:#c0392b;border:2px solid #fff;border-radius:2px;transform:rotate(45deg);box-shadow:0 1px 3px rgba(0,0,0,.3)"></div> Stop point</div>
   </div>
 </div>
+
 
 <!-- ── Spinner ── -->
 <div id="spinner">
@@ -521,6 +599,8 @@ let drawDots  = [];
 let _robotMarker  = null;
 let _passedLine   = null;
 let _passedWpIdx  = 0;
+let _stopPts      = [];   // {index, latitude, longitude, marker}
+let _stopMode     = false;
 
 // ═══════════════════════════════════════════════════════════════════
 // Map
@@ -535,6 +615,7 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
 map.on('click', e => {
   if (mode === 'define') addStop(e.latlng.lat, e.latlng.lng);
   else if (mode === 'draw') addDrawPoint(e.latlng.lat, e.latlng.lng);
+  else if (mode === 'edit' && _stopMode) _addStopAtLatLng(e.latlng.lat, e.latlng.lng);
 });
 
 map.on('contextmenu', e => {
@@ -610,6 +691,7 @@ function clearStops() {
   if (routeLine)  { routeLine.remove();  routeLine  = null; }
   if (_passedLine){ _passedLine.remove(); _passedLine = null; }
   _passedWpIdx = 0;
+  clearAllStops();
   document.getElementById('tab-edit').disabled = true;
   document.getElementById('wp-info').innerHTML = 'No waypoints yet.';
 }
@@ -767,6 +849,7 @@ function loadWaypoints(wps) {
   if (routeLine) routeLine.remove();
   if (_passedLine) { _passedLine.remove(); _passedLine = null; }
   _passedWpIdx = 0;
+  clearAllStops();
 
   waypoints = wps.map(wp => ({...wp, marker: null}));
 
@@ -1061,6 +1144,154 @@ setInterval(async () => {
 }, 500);
 
 // ═══════════════════════════════════════════════════════════════════
+// Stop points
+// ═══════════════════════════════════════════════════════════════════
+
+function _stopDiamondHtml(num) {
+  return `<div style="position:relative;width:44px;height:44px;display:flex;align-items:center;justify-content:center">` +
+    `<div style="width:28px;height:28px;background:#c0392b;border:3px solid #fff;border-radius:5px;transform:rotate(45deg);box-shadow:0 3px 8px rgba(0,0,0,.5)"></div>` +
+    `<span style="position:absolute;color:#fff;font-size:13px;font-weight:800;line-height:1">${num}</span></div>`;
+}
+
+function _attachStopMarker(sp) {
+  const num = _stopPts.indexOf(sp) + 1;
+  const m = L.marker([sp.latitude, sp.longitude], {
+    icon: L.divIcon({className:'', html:_stopDiamondHtml(num), iconSize:[44,44], iconAnchor:[22,22]}),
+    zIndexOffset: 300
+  }).addTo(map);
+  m.bindTooltip(`Stop ${num} (WP #${sp.index + 1})`, {direction:'top'});
+  m.on('contextmenu', e => {
+    L.DomEvent.stopPropagation(e);
+    m.remove(); sp.marker = null;
+    const i = _stopPts.indexOf(sp);
+    if (i !== -1) { _stopPts.splice(i, 1); _rebuildStopMarkers(); _refreshStopListUI(); }
+  });
+  sp.marker = m;
+}
+
+function _rebuildStopMarkers() {
+  _stopPts.forEach(sp => { if (sp.marker) { sp.marker.remove(); sp.marker = null; } });
+  _stopPts.forEach(sp => _attachStopMarker(sp));
+}
+
+function _refreshStopListUI() {
+  const el = document.getElementById('stop-pts-count');
+  if (el) el.textContent = _stopPts.length;
+  const ul = document.getElementById('stops-list-ui');
+  if (!ul) return;
+  ul.innerHTML = '';
+  _stopPts.forEach((sp, i) => {
+    const li = document.createElement('li');
+    li.className = 'stop-item-ui';
+    li.innerHTML =
+      `<div class="stop-diamond-sm"></div>` +
+      `<div style="flex:1;font-size:11px;color:#555;font-family:monospace;line-height:1.5">` +
+      `Stop ${i+1} — WP #${sp.index+1}<br>${sp.latitude.toFixed(6)}, ${sp.longitude.toFixed(6)}</div>` +
+      `<span style="cursor:pointer;color:#ccc;font-size:18px;line-height:1" onclick="removeStopAt(${i})" title="Remove">×</span>`;
+    ul.appendChild(li);
+  });
+}
+
+function removeStopAt(i) {
+  if (_stopPts[i] && _stopPts[i].marker) _stopPts[i].marker.remove();
+  _stopPts.splice(i, 1);
+  _rebuildStopMarkers();
+  _refreshStopListUI();
+}
+
+function clearAllStops() {
+  _stopPts.forEach(sp => sp.marker && sp.marker.remove());
+  _stopPts = [];
+  if (_stopMode) toggleStopMode();
+  _refreshStopListUI();
+}
+
+function _addStopByIndex(idx) {
+  if (_stopPts.some(s => s.index === idx)) return;
+  const wp = waypoints[idx];
+  const sp = {index: idx, latitude: wp.latitude, longitude: wp.longitude, marker: null};
+  _stopPts.push(sp);
+  _stopPts.sort((a, b) => a.index - b.index);
+  _attachStopMarker(sp);
+  _refreshStopListUI();
+}
+
+function _addStopAtLatLng(lat, lng) {
+  if (!waypoints.length) return;
+  let minD = Infinity, nearestIdx = -1;
+  waypoints.forEach((wp, i) => {
+    const d = haversineM(lat, lng, wp.latitude, wp.longitude);
+    if (d < minD) { minD = d; nearestIdx = i; }
+  });
+  if (nearestIdx >= 0) _addStopByIndex(nearestIdx);
+}
+
+function toggleStopMode() {
+  _stopMode = !_stopMode;
+  const btn = document.getElementById('btn-add-stop');
+  if (!btn) return;
+  if (_stopMode) {
+    btn.textContent = '✓ Done';
+    btn.classList.add('active');
+    map.getContainer().style.cursor = 'crosshair';
+  } else {
+    btn.textContent = '+ Add Stop';
+    btn.classList.remove('active');
+    map.getContainer().style.cursor = '';
+  }
+}
+
+function autoGenStops() {
+  if (!waypoints.length) { status('Generate route first', 'err'); return; }
+  const interval = parseFloat(document.getElementById('stop-interval').value);
+  if (!interval || interval <= 0) { status('Enter a valid interval', 'err'); return; }
+  _stopPts.forEach(sp => sp.marker && sp.marker.remove());
+  _stopPts = [];
+  let cumDist = 0, nextStop = interval;
+  for (let i = 1; i < waypoints.length; i++) {
+    cumDist += haversineM(waypoints[i-1].latitude, waypoints[i-1].longitude,
+                          waypoints[i].latitude,   waypoints[i].longitude);
+    if (cumDist >= nextStop) {
+      const wp = waypoints[i];
+      _stopPts.push({index: i, latitude: wp.latitude, longitude: wp.longitude, marker: null});
+      nextStop = cumDist + interval;
+    }
+  }
+  _stopPts.forEach(sp => _attachStopMarker(sp));
+  _refreshStopListUI();
+  status(`Generated ${_stopPts.length} stops every ${interval} m`, 'ok');
+}
+
+async function saveStopsConfig() {
+  const body = {
+    confirmation_topic: document.getElementById('stop-confirm-topic').value.trim(),
+    reached_topic:      document.getElementById('stop-reached-topic').value.trim(),
+    stops: _stopPts.map(s => ({index: s.index, latitude: s.latitude, longitude: s.longitude}))
+  };
+  try {
+    const r = await fetch('/api/stops_config', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error);
+    status(`✓ ${d.count} stop(s) saved`, 'ok');
+  } catch(e) { status('✗ ' + e.message, 'err'); }
+}
+
+async function loadStopsTopics() {
+  try {
+    const r = await fetch('/api/stops_config');
+    if (!r.ok) return;
+    const d = await r.json();
+    const ct = document.getElementById('stop-confirm-topic');
+    const rt = document.getElementById('stop-reached-topic');
+    if (ct && d.confirmation_topic) ct.value = d.confirmation_topic;
+    if (rt && d.reached_topic)      rt.value = d.reached_topic;
+  } catch {}
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Navigation control
 // ═══════════════════════════════════════════════════════════════════
 let _navState = 'stopped';
@@ -1088,6 +1319,7 @@ function _applyNavState(state) {
 }
 
 async function navStart() {
+  await saveStopsConfig();   // persist latest stop config before launching follower
   try {
     const r = await fetch('/api/nav/start', {method:'POST'});
     const d = await r.json();
@@ -1126,9 +1358,59 @@ setInterval(async () => {
 }, 2000);
 
 // ═══════════════════════════════════════════════════════════════════
+// Stop confirmation popup (Leaflet popup on the stop marker)
+// ═══════════════════════════════════════════════════════════════════
+let _stopPopup = null;
+
+function showStopPopup(msg) {
+  if (_stopPopup) return;  // already open
+  // Parse "Stop1, lat 13.123456, long 100.234567"
+  const m = msg.match(/Stop(\\d+),\\s*lat\\s*([\\d.-]+),\\s*long\\s*([\\d.-]+)/i);
+  if (!m) return;
+  const [, num, lat, lon] = m;
+  const content =
+    `<div style="text-align:center;min-width:160px;font-family:system-ui,sans-serif;padding:2px 0">` +
+    `<div style="font-weight:700;font-size:13px;color:#c0392b;margin-bottom:4px">🛑 Stop ${num}</div>` +
+    `<div style="font-size:11px;color:#888;font-family:monospace;margin-bottom:10px">` +
+    `${parseFloat(lat).toFixed(6)}, ${parseFloat(lon).toFixed(6)}</div>` +
+    `<button onclick="confirmStop()" style="padding:7px 0;background:#27ae60;color:#fff;` +
+    `border:none;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;width:100%">` +
+    `&#10003; Confirm</button></div>`;
+  _stopPopup = L.popup({closeButton: false, autoClose: false, closeOnClick: false, maxWidth: 200})
+    .setLatLng([parseFloat(lat), parseFloat(lon)])
+    .setContent(content)
+    .openOn(map);
+  status(`Robot waiting at Stop ${num}`, 'info');
+}
+
+function hideStopPopup() {
+  if (_stopPopup) { map.closePopup(_stopPopup); _stopPopup = null; }
+}
+
+async function confirmStop() {
+  try {
+    await fetch('/api/stop_confirm', {method: 'POST'});
+    hideStopPopup();
+    status('Stop confirmed — robot continuing', 'ok');
+  } catch(e) { status('✗ Confirm failed: ' + e.message, 'err'); }
+}
+
+// Poll stop status every 1 s
+setInterval(async () => {
+  try {
+    const r = await fetch('/api/stop_status');
+    const d = await r.json();
+    if (d.waiting) showStopPopup(d.message);
+    else hideStopPopup();
+  } catch {}
+}, 1000);
+
+// ═══════════════════════════════════════════════════════════════════
 // Boot: load config + center on reference
 // ═══════════════════════════════════════════════════════════════════
 (async () => {
+  await loadStopsTopics();
+
   try {
     const r = await fetch('/api/config');
     if (r.ok) {

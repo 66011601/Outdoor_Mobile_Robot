@@ -198,10 +198,10 @@ global_costmap:
       # fit on a big static costmap. Thus it is recommended to use a rolling global costmap large enough to
       # contain each pair of successive waypoints. See: https://github.com/ros-planning/navigation2/issues/2174
       rolling_window: True
-      width: 200
-      height: 200
-      origin_x: 100.0
-      origin_y: 100.0
+      width: 100
+      height: 100
+      origin_x: 50.0
+      origin_y: 50.0
       track_unknown_space: true
       # no static map
       plugins: ["obstacle_layer", "inflation_layer"]
