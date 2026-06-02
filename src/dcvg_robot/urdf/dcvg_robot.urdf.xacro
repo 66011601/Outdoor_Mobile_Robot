@@ -63,6 +63,14 @@
   <xacro:property name="imu_z"          value="0.32499184842320095"/>
   <xacro:property name="imu_mass"       value="0.05"/>
 
+  <!-- Depth camera (D455: 124×26×25 mm, 87° H-FOV, depth 0.6-6 m) -->
+  <xacro:property name="cam_x"          value="0.52"/>
+  <xacro:property name="cam_z"          value="0.45"/>
+  <xacro:property name="cam_size_x"     value="0.026"/>
+  <xacro:property name="cam_size_y"     value="0.124"/>
+  <xacro:property name="cam_size_z"     value="0.025"/>
+  <xacro:property name="cam_mass"       value="0.1"/>
+
   <!-- <xacro:property name="pi" value="3.1415926535897931" /> -->
 
   <!-- ================================================================
@@ -233,7 +241,7 @@
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry>
-        <box size="${box_x_size} ${box_y_size} ${box_col_z}"/>
+        <box size="${box_x_size} ${box_y_size} 0"/>
       </geometry>
     </collision>
     <xacro:box_inertia m="${box_mass}" a="${box_x_size}" b="${box_y_size}" c="${box_z_size}"/>
@@ -263,6 +271,39 @@
     </collision>
     <xacro:cylinder_inertia m="${lidar_mass}" r="${lidar_radius}" h="${lidar_length}"/>
   </link>
+
+  <!-- Depth camera -->
+  <joint name="base_link_to_camera" type="fixed">
+    <parent link="base_link"/>
+    <child link="camera_link"/>
+    <origin xyz="${cam_x} 0 ${cam_z}" rpy="0 0 0"/>
+  </joint>
+  <link name="camera_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="${cam_size_x} ${cam_size_y} ${cam_size_z}"/>
+      </geometry>
+      <material name="camera-material">
+        <color rgba="0.1 0.1 0.1 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="${cam_size_x} ${cam_size_y} ${cam_size_z}"/>
+      </geometry>
+    </collision>
+    <xacro:box_inertia m="${cam_mass}" a="${cam_size_x}" b="${cam_size_y}" c="${cam_size_z}"/>
+  </link>
+
+  <!-- Optical frame: ROS convention (Z forward, X right, Y down) -->
+  <joint name="camera_optical_joint" type="fixed">
+    <parent link="camera_link"/>
+    <child link="camera_optical_frame"/>
+    <origin xyz="0 0 0" rpy="${-pi/2} 0 ${-pi/2}"/>
+  </joint>
+  <link name="camera_optical_frame"/>
 
   <!-- GPS (placeholder — no visual) -->
   <joint name="gps_joint" type="fixed">
@@ -335,7 +376,7 @@
       <wheel_diameter>${2 * wheel_radius}</wheel_diameter>
       <max_wheel_torque>20</max_wheel_torque>
       <max_wheel_acceleration>1.0</max_wheel_acceleration>
-      <publish_odom>true</publish_odom>
+      <publish_odom>false</publish_odom>
       <publish_odom_tf>false</publish_odom_tf>
       <publish_wheel_tf>false</publish_wheel_tf>
       <odometry_frame>odom</odometry_frame>
@@ -388,13 +429,27 @@
     </sensor>
   </gazebo>
 
-  <!-- IMU — publishes sensor_msgs/Imu on /imu/data -->
+  <!-- IMU — publishes sensor_msgs/Imu on /imu/data
+       Noise based on D455 BMI055 datasheet (same class as D457 ICM-42688-P):
+         Gyro  noise density : 0.014 °/s/√Hz → stddev 1.7e-3 rad/s at 100 Hz
+         Gyro  bias instability: ~0.5°/hr     → bias_mean 5e-4 rad/s
+         Accel noise density : 150 μg/√Hz    → stddev 1.04e-2 m/s² at 100 Hz
+         Accel bias (initial): ~5 mg          → bias_mean 0.05 m/s² -->
   <gazebo reference="imu">
     <sensor type="imu" name="imu_sensor">
       <always_on>true</always_on>
       <update_rate>100</update_rate>
       <imu>
-        <noise><type>gaussian</type><mean>0.0</mean><stddev>0.0</stddev></noise>
+        <angular_velocity>
+          <x><noise type="gaussian"><mean>0.0</mean><stddev>1.7e-3</stddev><bias_mean>5e-4</bias_mean><bias_stddev>1e-4</bias_stddev></noise></x>
+          <y><noise type="gaussian"><mean>0.0</mean><stddev>1.7e-3</stddev><bias_mean>5e-4</bias_mean><bias_stddev>1e-4</bias_stddev></noise></y>
+          <z><noise type="gaussian"><mean>0.0</mean><stddev>1.7e-3</stddev><bias_mean>5e-4</bias_mean><bias_stddev>1e-4</bias_stddev></noise></z>
+        </angular_velocity>
+        <linear_acceleration>
+          <x><noise type="gaussian"><mean>0.0</mean><stddev>1.04e-2</stddev><bias_mean>0.05</bias_mean><bias_stddev>5e-3</bias_stddev></noise></x>
+          <y><noise type="gaussian"><mean>0.0</mean><stddev>1.04e-2</stddev><bias_mean>0.05</bias_mean><bias_stddev>5e-3</bias_stddev></noise></y>
+          <z><noise type="gaussian"><mean>0.0</mean><stddev>1.04e-2</stddev><bias_mean>0.05</bias_mean><bias_stddev>5e-3</bias_stddev></noise></z>
+        </linear_acceleration>
       </imu>
       <plugin name="imu_plugin" filename="libgazebo_ros_imu_sensor.so">
         <ros>
@@ -404,21 +459,84 @@
     </sensor>
   </gazebo>
 
-  <!-- GPS — publishes sensor_msgs/NavSatFix on /gps/fix -->
+  <!-- GPS — publishes sensor_msgs/NavSatFix on /gps/fix
+       Noise based on u-blox ZED-F9P datasheet (RTK Fixed mode with NTRIP):
+         Horizontal accuracy: 0.01m RMS + 1ppm baseline → stddev 0.013m
+         Vertical accuracy:   0.02m RMS (2× horizontal typical) → stddev 0.020m
+         Bias (mean): 0.003m horizontal, 0.005m vertical — residual multipath/atmospheric
+         Update rate: 5 Hz (F9P RTK typical output rate, vs M8N 1 Hz)
+
+       F9P operating modes for reference:
+         RTK Fixed (this):  horizontal 0.013m σ, vertical 0.020m σ  ← NTRIP converged
+         RTK Float:         horizontal 0.1m σ,   vertical 0.2m σ    ← converging
+         Standalone:        horizontal 1.7m σ,   vertical 2.5m σ    ← no corrections -->
   <gazebo reference="gps_link">
     <sensor name="gps_sensor" type="gps">
       <always_on>true</always_on>
-      <update_rate>1</update_rate>
+      <update_rate>5</update_rate>
       <gps>
         <position_sensing>
-          <horizontal><noise type="gaussian"><mean>0.0</mean><stddev>0.01</stddev></noise></horizontal>
-          <vertical><noise type="gaussian"><mean>0.0</mean><stddev>0.01</stddev></noise></vertical>
+          <horizontal><noise type="gaussian"><mean>0.003</mean><stddev>0.013</stddev></noise></horizontal>
+          <vertical><noise type="gaussian"><mean>0.005</mean><stddev>0.020</stddev></noise></vertical>
         </position_sensing>
       </gps>
       <plugin name="gps_plugin" filename="libgazebo_ros_gps_sensor.so">
         <ros><remapping>~/out:=/gps/fix</remapping></ros>
       </plugin>
     </sensor>
+  </gazebo>
+
+  <!-- D455 depth camera — RGB 1280×800 / Depth 1280×720, 87° H-FOV, 0.6-6 m -->
+  <gazebo reference="camera_link">
+    <sensor type="depth" name="d455_depth_sensor">
+      <always_on>true</always_on>
+      <visualize>true</visualize>
+      <update_rate>15</update_rate>
+      <camera name="d455">
+        <horizontal_fov>1.5184</horizontal_fov>  <!-- 87 degrees, D455 depth H-FOV -->
+        <image>
+          <width>640</width>
+          <height>360</height>
+          <format>R8G8B8</format>
+        </image>
+        <clip>
+          <near>0.6</near>   <!-- D455 min depth range -->
+          <far>6.0</far>     <!-- D455 max reliable outdoor depth -->
+        </clip>
+        <!-- D455 depth noise: <2% at 2m, ~5% at 4m, ~8% at 6m
+             Fixed stddev 0.015m represents ~1.5% average across 0.6-6m range -->
+        <noise>
+          <type>gaussian</type>
+          <mean>0.0</mean>
+          <stddev>0.015</stddev>
+        </noise>
+      </camera>
+      <plugin name="d455_camera_plugin" filename="libgazebo_ros_camera.so">
+        <!-- camera_name sets the ROS namespace; topics publish as /d455/image_raw,
+             /d455/depth/image_raw, /d455/points, /d455/camera_info, etc.
+             ros remappings are ignored by this plugin — use launch remappings instead. -->
+        <camera_name>d455</camera_name>
+        <frame_name>camera_optical_frame</frame_name>
+        <min_depth>0.6</min_depth>
+        <max_depth>6.0</max_depth>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <!-- Ground truth — publishes exact Gazebo physics pose as /ground_truth/odom
+       Used only for benchmarking VIO accuracy; not fed into EKF. -->
+  <gazebo>
+    <plugin name="p3d_ground_truth" filename="libgazebo_ros_p3d.so">
+      <ros>
+        <remapping>odom:=/ground_truth/odom</remapping>
+      </ros>
+      <body_name>base_footprint</body_name>
+      <frame_name>map</frame_name>
+      <update_rate>30</update_rate>
+      <xyz_offset>0 0 0</xyz_offset>
+      <rpy_offset>0 0 0</rpy_offset>
+      <gaussian_noise>0.0</gaussian_noise>
+    </plugin>
   </gazebo>
 
 </robot>

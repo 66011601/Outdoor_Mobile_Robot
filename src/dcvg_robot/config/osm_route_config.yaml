@@ -47,7 +47,7 @@ route:
   # Smaller = robot tracks the route more tightly (smoother path).
   # 5.0m is a good starting point with NEO-M8N GPS.
   # -----------------------------------------------------------------------
-  max_gap_m: 5.0
+  max_gap_m: 25.0
 
   # -----------------------------------------------------------------------
   # Lateral offset from the OSM route centerline.

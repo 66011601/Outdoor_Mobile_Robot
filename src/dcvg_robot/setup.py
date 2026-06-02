@@ -28,16 +28,13 @@ setup(
     license='TODO: License declaration',
     entry_points={
         'console_scripts': [
-            'odom = dcvg_robot.odom:main',
-            'forward_kinematics = dcvg_robot.forward_kinematics:main',
-            'inverse_kinematics = dcvg_robot.inverse_kinematics:main',
-            'dcvg_controller = dcvg_robot.dcvg_controller:main',
             'logged_waypoint_follower = dcvg_robot.logged_waypoint_follower:main',
             'interactive_waypoint_follower = dcvg_robot.interactive_waypoint_follower:main',
             'gps_waypoint_logger = dcvg_robot.gps_waypoint_logger:main',
             'route_waypoint_follower = dcvg_robot.route_waypoint_follower:main',
             'osm_route_generator = dcvg_robot.osm_route_generator:main',
             'osm_route_app = dcvg_robot.osm_route_app:main',
+            'odom_accuracy_plot = dcvg_robot.odom_accuracy_plot:main',
         ],
     },
 )

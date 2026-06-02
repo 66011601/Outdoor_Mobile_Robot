@@ -18,6 +18,7 @@ To confirm a stop from the terminal (first draft):
   ros2 topic pub --once /dcvg/stop_confirm std_msgs/msg/String "data: 'go'"
 """
 
+import math
 import os
 import sys
 
@@ -26,6 +27,7 @@ import yaml
 from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped
 from nav2_simple_commander.robot_navigator import BasicNavigator
+from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from robot_localization.srv import FromLL
 from std_msgs.msg import String
@@ -75,6 +77,18 @@ class RouteWaypointFollower(Node):
         self.navigator = BasicNavigator('basic_navigator')
         self.from_ll_client = self.create_client(FromLL, '/fromLL')
 
+        # Robot position — updated by odometry so we can skip close initial waypoints
+        self._robot_x = None
+        self._robot_y = None
+        self._odom_sub = self.create_subscription(
+            Odometry, '/odometry/local', self._odom_cb, 10)
+
+        # Minimum distances (metres) — tunable via ROS parameters
+        self.declare_parameter('min_start_distance', 5.0)
+        self.declare_parameter('min_wp_distance',    2.0)
+        self.min_start_dist: float = float(self.get_parameter('min_start_distance').value)
+        self.min_wp_dist:    float = float(self.get_parameter('min_wp_distance').value)
+
         with open(wps_file_path, 'r') as f:
             data = yaml.safe_load(f)
         self.waypoints = data['waypoints']
@@ -105,6 +119,10 @@ class RouteWaypointFollower(Node):
             self._stop_pub = self.create_publisher(String, self.reached_topic, 10)
             self._confirm_sub = self.create_subscription(
                 String, self.confirmation_topic, self._confirm_cb, 10)
+
+    def _odom_cb(self, msg: Odometry):
+        self._robot_x = msg.pose.pose.position.x
+        self._robot_y = msg.pose.pose.position.y
 
     def _confirm_cb(self, msg):
         self.get_logger().info(f"Stop confirmation received: '{msg.data}'")
@@ -201,6 +219,74 @@ class RouteWaypointFollower(Node):
         if not poses:
             self.get_logger().error("No valid waypoints — aborting")
             return
+
+        # ── Step 1: filter out consecutive waypoints that are too close ──────
+        filtered = [poses[0]]
+        for orig_idx, pose in poses[1:]:
+            px = filtered[-1][1].pose.position.x
+            py = filtered[-1][1].pose.position.y
+            cx = pose.pose.position.x
+            cy = pose.pose.position.y
+            if math.hypot(cx - px, cy - py) >= self.min_wp_dist:
+                filtered.append((orig_idx, pose))
+        removed = len(poses) - len(filtered)
+        if removed:
+            self.get_logger().info(
+                f"Filtered {removed} waypoint(s) closer than {self.min_wp_dist:.1f} m apart")
+        poses = filtered
+
+        # ── Step 2: skip initial waypoints too close to the robot's start ────
+        # Spin briefly to get a current odometry reading
+        for _ in range(20):
+            rclpy.spin_once(self, timeout_sec=0.05)
+            if self._robot_x is not None:
+                break
+
+        if self._robot_x is not None:
+            robot_x = float(self._robot_x)
+            robot_y = float(self._robot_y)
+            skipped = 0
+            first_dist = 0.0
+            while poses:
+                cx = poses[0][1].pose.position.x
+                cy = poses[0][1].pose.position.y
+                first_dist = math.hypot(cx - robot_x, cy - robot_y)
+                if first_dist < self.min_start_dist:
+                    self.get_logger().info(
+                        f"Skipping waypoint {poses[0][0] + 1} — "
+                        f"{first_dist:.1f} m from robot start (< {self.min_start_dist:.1f} m)")
+                    poses.pop(0)
+                    skipped += 1
+                else:
+                    break
+            if skipped:
+                self.get_logger().info(
+                    f"Skipped {skipped} near-start waypoint(s); "
+                    f"first target now {first_dist:.1f} m away")
+        else:
+            self.get_logger().warn(
+                "No odometry received — skipping proximity filter")
+
+        if not poses:
+            self.get_logger().error("All waypoints filtered out — aborting")
+            return
+
+        # ── Step 3: compute look-ahead yaw so robot faces the next waypoint ──
+        for i in range(len(poses)):
+            if i < len(poses) - 1:
+                nx = poses[i + 1][1].pose.position.x
+                ny = poses[i + 1][1].pose.position.y
+            else:
+                # last waypoint keeps the same heading as the previous segment
+                nx = poses[i][1].pose.position.x
+                ny = poses[i][1].pose.position.y
+                if i > 0:
+                    nx += poses[i][1].pose.position.x - poses[i - 1][1].pose.position.x
+                    ny += poses[i][1].pose.position.y - poses[i - 1][1].pose.position.y
+            cx = poses[i][1].pose.position.x
+            cy = poses[i][1].pose.position.y
+            yaw = math.atan2(ny - cy, nx - cx)
+            poses[i][1].pose.orientation = quaternion_from_euler(0.0, 0.0, yaw)
 
         _write_cmd('run')
         self.get_logger().info(

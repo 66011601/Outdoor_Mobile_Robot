@@ -12,7 +12,7 @@ def generate_launch_description():
     pkg = get_package_share_directory('dcvg_robot')
 
     xacro_file = os.path.join(pkg, 'urdf', 'dcvg_robot.urdf.xacro')
-    world_file = os.path.join(pkg, 'worlds', 'sonoma_raceway.world')
+    world_file = os.path.join(pkg, 'worlds', 'sonoma_raceway_with_elements.world')
 
     robot_description = ParameterValue(Command(['xacro ', xacro_file]), value_type=str)
 

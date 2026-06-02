@@ -36,6 +36,13 @@ def generate_launch_description():
                 os.path.join(launch_dir, 'dual_ekf_navsat.launch.py')),
         ),
 
+        # RTAB-Map: visual odometry (/vo) + ground-filtered obstacle cloud
+        # Must start after Gazebo (camera topics) and before Nav2 (obstacle source)
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                os.path.join(launch_dir, 'rtabmap.launch.py')),
+        ),
+
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 os.path.join(bringup_dir, 'launch', 'navigation_launch.py')),

@@ -49,7 +49,7 @@ def _start_ros_monitor():
 
             # Change '/gps/fix' if your GPS topic name differs
             node.create_subscription(NavSatFix, '/gps/fix', gps_cb, 10)
-            node.create_subscription(Odometry, '/odom', odom_cb, 10)
+            node.create_subscription(Odometry, '/odometry/local', odom_cb, 10)
             rclpy.spin(node)
         except Exception as exc:
             print(f'[osm_route_app] ROS monitor unavailable: {exc}')
@@ -133,10 +133,10 @@ def api_generate():
         return jsonify({'error': 'Need at least 2 stops'}), 400
 
     cfg = {
-        'network_type':     cfg_params.get('network_type', 'walk'),
+        'network_type':     cfg_params.get('network_type', 'none (straight line)'),
         'custom_filter':    cfg_params.get('custom_filter') or None,
         'buffer_m':         float(cfg_params.get('buffer_m', 200.0)),
-        'max_gap_m':        float(cfg_params.get('max_gap_m', 5.0)),
+        'max_gap_m':        float(cfg_params.get('max_gap_m', 25.0)),
         'lateral_offset_m': float(cfg_params.get('lateral_offset_m', 0.0)),
         'offset_side':      cfg_params.get('offset_side', 'right'),
     }
@@ -317,10 +317,10 @@ def api_config():
         data = yaml.safe_load(f)
     r = data.get('route', {})
     return jsonify({'config': {
-        'network_type':     r.get('network_type', 'walk'),
+        'network_type':     r.get('network_type', 'none (straight line)'),
         'custom_filter':    r.get('custom_filter') or '',
         'buffer_m':         r.get('buffer_m', 200.0),
-        'max_gap_m':        r.get('max_gap_m', 5.0),
+        'max_gap_m':        r.get('max_gap_m', 25.0),
         'lateral_offset_m': r.get('lateral_offset_m', 0.0),
         'offset_side':      r.get('offset_side', 'right'),
     }})
@@ -474,7 +474,7 @@ body{font-family:system-ui,sans-serif;font-size:13px;display:flex;height:100vh;o
         <select id="cfg-network" onchange="onNetworkChange()"><option value="walk">walk</option><option value="bike">bike</option><option value="drive">drive</option><option value="drive_service">drive_service</option><option value="all">all</option><option value="all_private">all_private</option><option value="none">none (straight line)</option></select>
       </div>
       <div class="row"><label>Max gap (m)</label>
-        <input type="number" id="cfg-gap" value="5" step="0.5" min="1"/>
+        <input type="number" id="cfg-gap" value="25" step="0.5" min="1"/>
       </div>
       <div class="row"><label>Lateral offset</label>
         <input type="number" id="cfg-offset" value="0" step="0.5"/>
