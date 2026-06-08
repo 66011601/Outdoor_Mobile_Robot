@@ -11,7 +11,7 @@ bt_navigator:
     use_sim_time: True
     global_frame: map
     robot_base_frame: base_link
-    odom_topic: /odom
+    odom_topic: odometry/local
     bt_loop_duration: 10
     default_server_timeout: 20
     navigators: ["navigate_to_pose", "navigate_through_poses"]
@@ -165,7 +165,7 @@ local_costmap:
         enabled: True
         observation_sources: scan depth_obstacles
         scan:
-          topic: /scan
+          topic: /lidar/scan
           max_obstacle_height: 2.0
           clearing: True
           marking: True
@@ -208,7 +208,9 @@ global_costmap:
       height: 100
       origin_x: 50.0
       origin_y: 50.0
-      track_unknown_space: true
+      # treat unknown cells as free so the planner goes straight instead of
+      # hugging the edges of already-cleared space
+      track_unknown_space: false
       # no static map
       plugins: ["obstacle_layer", "inflation_layer"]
       obstacle_layer:
@@ -216,7 +218,7 @@ global_costmap:
         enabled: True
         observation_sources: scan depth_obstacles
         scan:
-          topic: /scan
+          topic: /lidar/scan
           max_obstacle_height: 2.0
           clearing: True
           marking: True
@@ -240,8 +242,9 @@ global_costmap:
           obstacle_min_range: 0.6
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 0.5
-        inflation_radius: 6.0
+        # faster drop-off keeps inflation tight around actual obstacles
+        cost_scaling_factor: 3.0
+        inflation_radius: 2.0
       always_send_full_costmap: True
 
 # The yaml_filename does not need to be specified since it going to be set by defaults in launch.
@@ -329,7 +332,7 @@ velocity_smoother:
     min_velocity: [-10.2, 0.0, -4.0]
     max_accel: [5.0, 0.0, 6.4]
     max_decel: [-5.0, 0.0, -6.4]
-    odom_topic: "odom"
+    odom_topic: "odometry/local"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
     velocity_timeout: 1.0
