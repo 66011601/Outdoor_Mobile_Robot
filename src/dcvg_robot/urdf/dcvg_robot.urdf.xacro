@@ -65,11 +65,16 @@
 
   <!-- Depth camera (D455: 124×26×25 mm, 87° H-FOV, depth 0.6-6 m) -->
   <xacro:property name="cam_x"          value="0.52"/>
-  <xacro:property name="cam_z"          value="0.45"/>
+  <xacro:property name="cam_z"          value="0.60"/>
   <xacro:property name="cam_size_x"     value="0.026"/>
   <xacro:property name="cam_size_y"     value="0.124"/>
   <xacro:property name="cam_size_z"     value="0.025"/>
   <xacro:property name="cam_mass"       value="0.1"/>
+
+  <!-- [ADDED] D457 stereo IR camera pair — 95 mm baseline (identical to D455 body)
+       Left IR camera sits at +Y (robot-left), right IR camera at -Y (robot-right).
+       stereo_half_base offsets each camera ±47.5 mm from the camera_link centre. -->
+  <xacro:property name="stereo_half_base" value="0.0475"/>
 
   <!-- <xacro:property name="pi" value="3.1415926535897931" /> -->
 
@@ -305,6 +310,38 @@
   </joint>
   <link name="camera_optical_frame"/>
 
+  <!-- [ADDED] Left stereo camera link — D457 IR left sensor, offset +Y from camera_link centre -->
+  <joint name="camera_left_joint" type="fixed">
+    <parent link="camera_link"/>
+    <child link="camera_link_left"/>
+    <origin xyz="0 ${stereo_half_base} 0" rpy="0 0 0"/>
+  </joint>
+  <link name="camera_link_left"/>
+
+  <!-- [ADDED] Left stereo optical frame — same ROS optical convention (Z fwd, X right, Y down) -->
+  <joint name="camera_left_optical_joint" type="fixed">
+    <parent link="camera_link_left"/>
+    <child link="camera_optical_frame_left"/>
+    <origin xyz="0 0 0" rpy="${-pi/2} 0 ${-pi/2}"/>
+  </joint>
+  <link name="camera_optical_frame_left"/>
+
+  <!-- [ADDED] Right stereo camera link — D457 IR right sensor, offset -Y from camera_link centre -->
+  <joint name="camera_right_joint" type="fixed">
+    <parent link="camera_link"/>
+    <child link="camera_link_right"/>
+    <origin xyz="0 ${-stereo_half_base} 0" rpy="0 0 0"/>
+  </joint>
+  <link name="camera_link_right"/>
+
+  <!-- [ADDED] Right stereo optical frame -->
+  <joint name="camera_right_optical_joint" type="fixed">
+    <parent link="camera_link_right"/>
+    <child link="camera_optical_frame_right"/>
+    <origin xyz="0 0 0" rpy="${-pi/2} 0 ${-pi/2}"/>
+  </joint>
+  <link name="camera_optical_frame_right"/>
+
   <!-- GPS (placeholder — no visual) -->
   <joint name="gps_joint" type="fixed">
     <parent link="base_link"/>
@@ -491,17 +528,17 @@
     <sensor type="depth" name="d455_depth_sensor">
       <always_on>true</always_on>
       <visualize>true</visualize>
-      <update_rate>15</update_rate>
+      <update_rate>60</update_rate>
       <camera name="d455">
         <horizontal_fov>1.5184</horizontal_fov>  <!-- 87 degrees, D455 depth H-FOV -->
         <image>
-          <width>640</width>
-          <height>360</height>
+          <width>1280</width>
+          <height>720</height>
           <format>R8G8B8</format>
         </image>
         <clip>
-          <near>0.6</near>   <!-- D455 min depth range -->
-          <far>6.0</far>     <!-- D455 max reliable outdoor depth -->
+          <near>0.1</near>   <!-- D455 min depth range -->
+          <far>100.0</far>     <!-- D455 max reliable outdoor depth -->
         </clip>
         <!-- D455 depth noise: <2% at 2m, ~5% at 4m, ~8% at 6m
              Fixed stddev 0.015m represents ~1.5% average across 0.6-6m range -->
@@ -519,6 +556,69 @@
         <frame_name>camera_optical_frame</frame_name>
         <min_depth>0.6</min_depth>
         <max_depth>6.0</max_depth>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <!-- [FIXED] D457 left IR camera — uses libgazebo_ros_camera.so (same plugin as D455,
+       confirmed working in ROS2). libgazebo_ros_multicamera.so was removed because its
+       ROS2 parameter API is inconsistent and produced no topics.
+       Two separate sensors fire in the same Gazebo physics step so timestamps are
+       effectively identical; approx_sync with 50 ms tolerance handles any jitter.
+       Publishes: /d457/left/image_raw, /d457/left/camera_info -->
+  <gazebo reference="camera_link_left">
+    <sensor type="camera" name="d457_left_sensor">
+      <always_on>true</always_on>
+      <visualize>true</visualize>
+      <update_rate>30</update_rate>
+      <camera name="d457_left">
+        <horizontal_fov>1.5184</horizontal_fov>  <!-- 87° — D457 IR camera H-FOV -->
+        <image>
+          <width>1280</width>   <!-- D457 IR native resolution (16:9) -->
+          <height>720</height>
+          <format>R8G8B8</format>
+        </image>
+        <clip>
+          <near>0.4</near>    <!-- D457 IR min reliable range -->
+          <far>20.0</far>     <!-- beyond 20 m disparity noise dominates at 95 mm baseline -->
+        </clip>
+        <noise><type>gaussian</type><mean>0.0</mean><stddev>0.0</stddev></noise>
+      </camera>
+      <plugin name="d457_left_plugin" filename="libgazebo_ros_camera.so">
+        <camera_name>d457/left</camera_name>
+        <frame_name>camera_optical_frame_left</frame_name>
+        <!-- no hack_baseline on left: it is the reference camera, Tx = 0 in P matrix -->
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <!-- [FIXED] D457 right IR camera — separate libgazebo_ros_camera.so plugin.
+       hack_baseline=0.095 encodes the 95 mm D457 baseline into camera_info:
+         P_right[0][3] = -fx * 0.095
+       RTAB-Map stereo_odometry reads this to triangulate metric depth from disparity.
+       Publishes: /d457/right/image_raw, /d457/right/camera_info -->
+  <gazebo reference="camera_link_right">
+    <sensor type="camera" name="d457_right_sensor">
+      <always_on>true</always_on>
+      <visualize>true</visualize>
+      <update_rate>90</update_rate>
+      <camera name="d457_right">
+        <horizontal_fov>1.5184</horizontal_fov>
+        <image>
+          <width>1280</width>
+          <height>720</height>
+          <format>R8G8B8</format>
+        </image>
+        <clip>
+          <near>0.4</near>
+          <far>20.0</far>
+        </clip>
+        <noise><type>gaussian</type><mean>0.0</mean><stddev>0.0</stddev></noise>
+      </camera>
+      <plugin name="d457_right_plugin" filename="libgazebo_ros_camera.so">
+        <camera_name>d457/right</camera_name>
+        <frame_name>camera_optical_frame_right</frame_name>
+        <hack_baseline>0.095</hack_baseline>
       </plugin>
     </sensor>
   </gazebo>

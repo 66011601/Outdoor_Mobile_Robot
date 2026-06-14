@@ -1,8 +1,12 @@
 """
 odom_accuracy_plot.py
 
-Records /odometry/global vs /ground_truth/odom, computes position error,
-and saves a PNG plot + CSV on Ctrl+C.
+Subscribes to /ground_truth/odom (Gazebo) and /odometry/local (robot_localization EKF)
+to evaluate localization accuracy. On Ctrl+C, saves two separate PNG files plus a CSV:
+
+  odom_route_<label>_<stamp>.png  — 2D trajectory: ground truth vs /odometry/local
+  odom_error_<label>_<stamp>.png  — position error over time  (Y-axis fixed 0–10 m)
+  odom_accuracy_<label>_<stamp>.csv
 
 Run twice to compare modes:
   # Mode 1 — GPS + IMU only (comment out /vo in dual_ekf_navsat_params.yaml first)
@@ -10,9 +14,42 @@ Run twice to compare modes:
 
   # Mode 2 — GPS + IMU + VIO (uncomment /vo blocks)
   ros2 run dcvg_robot odom_accuracy_plot --ros-args -p label:=GPS_IMU_VIO
-
-Results saved to /tmp/odom_accuracy_<label>_<timestamp>.png / .csv
 """
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Appearance — edit here to restyle all output, no need to touch the class
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ROUTE_FIGSIZE   = (10, 8)       # (width, height) inches — route comparison plot
+ERROR_FIGSIZE   = (10, 6)       # (width, height) inches — error over time plot
+FIGURE_DPI      = 150           # output PNG resolution
+
+COLOR_GT        = '#2ecc71'     # ground truth trajectory line
+COLOR_EST       = '#e74c3c'     # /odometry/local (EKF estimate) line
+COLOR_ERROR     = '#3498db'     # error curve
+COLOR_MEAN      = '#e67e22'     # mean-error horizontal line
+COLOR_RMSE      = '#c0392b'     # RMSE horizontal line
+COLOR_START     = '#2c3e50'     # start-point dot (both plots)
+COLOR_GRID      = '#cccccc'     # grid line colour
+
+LW_GT           = 2.5           # linewidth — ground truth
+LW_EST          = 2.0           # linewidth — estimate
+LW_ERROR        = 1.5           # linewidth — error curve
+LW_STAT         = 1.5           # linewidth — mean / RMSE reference lines
+
+ERROR_YMIN      = 0.0           # error plot Y-axis lower bound (m)
+ERROR_YMAX      = 10.0          # error plot Y-axis upper bound (m) — keep fixed for comparability
+GRID_ALPHA      = 0.35          # grid line transparency  (0 = invisible, 1 = solid)
+
+FONT_SUPTITLE   = 14            # figure-level title font size
+FONT_AX_TITLE   = 12            # axes subtitle font size
+
+TOPIC_GT        = '/ground_truth/odom'  # Gazebo ground-truth odometry
+TOPIC_EST       = '/odometry/global'     # robot_localization EKF output
+
+OUTPUT_DIR      = '/home/thana/VIO_Compare'                # directory for saved files
+
+# ═══════════════════════════════════════════════════════════════════════════════
 
 import math
 from datetime import datetime
@@ -35,28 +72,30 @@ class OdomAccuracyPlot(Node):
         self._label = str(self.get_parameter('label').value)
 
         # Raw storage — collected at each topic's own rate
-        self._gt:   list[tuple[float, float, float]] = []   # (t, x, y)
-        self._est:  list[tuple[float, float, float]] = []
+        self._gt:  list[tuple[float, float, float]] = []   # (t, x, y)
+        self._est: list[tuple[float, float, float]] = []
 
         self._gt_latest  = None
         self._est_latest = None
         self._t0: float | None = None
 
-        # Initial position offset (calibrated from first reading so both
-        # trajectories start at 0,0 regardless of Gazebo/map frame offset)
+        # Initial position offset — both trajectories normalised to start at (0, 0)
         self._gt_x0  = None
         self._est_x0 = None
 
         self._gt_sub = self.create_subscription(
-            Odometry, '/ground_truth/odom', self._gt_cb, 20)
+            Odometry, TOPIC_GT, self._gt_cb, 20)
         self._est_sub = self.create_subscription(
-            Odometry, '/odometry/global', self._est_cb, 20)
+            Odometry, TOPIC_EST, self._est_cb, 20)
 
         # Record matched pairs at 10 Hz
         self.create_timer(0.1, self._record_tick)
 
         self.get_logger().info(
-            f"[odom_accuracy_plot] recording '{self._label}' — press Ctrl+C to stop and plot")
+            f"[odom_accuracy_plot] recording '{self._label}'\n"
+            f"  ground truth : {TOPIC_GT}\n"
+            f"  estimate     : {TOPIC_EST}\n"
+            f"  Press Ctrl+C to stop and save plots.")
 
     # ── callbacks ────────────────────────────────────────────────────────────
 
@@ -79,7 +118,6 @@ class OdomAccuracyPlot(Node):
         ex = self._est_latest.pose.pose.position.x
         ey = self._est_latest.pose.pose.position.y
 
-        # Calibrate initial offset on first sample so both start at (0, 0)
         if self._gt_x0 is None:
             self._gt_x0  = (gx, gy)
             self._est_x0 = (ex, ey)
@@ -104,64 +142,95 @@ class OdomAccuracyPlot(Node):
         est_x  = np.array([r[1] for r in self._est])
         est_y  = np.array([r[2] for r in self._est])
 
-        # Interpolate ground truth onto estimate timestamps for error calculation
-        gt_xi = np.interp(ts_est, ts_gt, gt_x)
-        gt_yi = np.interp(ts_est, ts_gt, gt_y)
+        # Interpolate ground truth onto estimate timestamps for error
+        gt_xi  = np.interp(ts_est, ts_gt, gt_x)
+        gt_yi  = np.interp(ts_est, ts_gt, gt_y)
         errors = np.sqrt((est_x - gt_xi)**2 + (est_y - gt_yi)**2)
 
         mean_err = float(np.mean(errors))
         max_err  = float(np.max(errors))
         rmse     = float(np.sqrt(np.mean(errors**2)))
 
-        # ── figure ────────────────────────────────────────────────────────────
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-        fig.suptitle(f'Odometry Accuracy — {self._label}', fontsize=14, fontweight='bold')
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self._save_route_plot(gt_x, gt_y, est_x, est_y, stamp)
+        self._save_error_plot(ts_est, errors, mean_err, rmse, stamp)
+        self._save_csv(ts_est, gt_xi, gt_yi, est_x, est_y, errors, stamp)
 
-        # Left: 2D trajectory
-        ax1.plot(gt_x,  gt_y,  'g-',  linewidth=2.0, label='Ground truth', zorder=3)
-        ax1.plot(est_x, est_y, 'r--', linewidth=1.5, label=self._label,    zorder=2)
-        ax1.scatter([0], [0], c='black', s=80, zorder=5, label='Start')
-        ax1.set_xlabel('X (m)')
-        ax1.set_ylabel('Y (m)')
-        ax1.set_title('2D Trajectory')
-        ax1.legend()
-        ax1.grid(True, alpha=0.4)
-        ax1.set_aspect('equal')
-
-        # Right: error over time
-        ax2.plot(ts_est, errors, 'b-', linewidth=1.5, label='Position error', zorder=3)
-        ax2.axhline(mean_err, color='orange', linestyle='--', linewidth=1.5,
-                    label=f'Mean  {mean_err:.2f} m', zorder=2)
-        ax2.axhline(rmse, color='red', linestyle=':', linewidth=1.5,
-                    label=f'RMSE  {rmse:.2f} m', zorder=2)
-        ax2.set_xlabel('Time (s)')
-        ax2.set_ylabel('Error (m)')
-        ax2.set_title('Position Error over Time')
-        ax2.legend()
-        ax2.grid(True, alpha=0.4)
-        ax2.set_ylim(bottom=0)
-
-        plt.tight_layout()
-
-        # ── save ──────────────────────────────────────────────────────────────
-        stamp    = datetime.now().strftime('%Y%m%d_%H%M%S')
-        png_path = f'/tmp/odom_accuracy_{self._label}_{stamp}.png'
-        csv_path = f'/tmp/odom_accuracy_{self._label}_{stamp}.csv'
-
-        plt.savefig(png_path, dpi=150, bbox_inches='tight')
-
-        with open(csv_path, 'w') as f:
-            f.write('time,gt_x,gt_y,est_x,est_y,error\n')
-            for i in range(len(ts_est)):
-                f.write(f"{ts_est[i]:.3f},{gt_xi[i]:.4f},{gt_yi[i]:.4f},"
-                        f"{est_x[i]:.4f},{est_y[i]:.4f},{errors[i]:.4f}\n")
-
-        self.get_logger().info(f"Plot  → {png_path}")
-        self.get_logger().info(f"CSV   → {csv_path}")
         self.get_logger().info(
             f"Stats → mean {mean_err:.3f} m  RMSE {rmse:.3f} m  "
             f"max {max_err:.3f} m  samples {len(errors)}")
 
+    # ── route comparison ─────────────────────────────────────────────────────
+
+    def _save_route_plot(self, gt_x, gt_y, est_x, est_y, stamp):
+        fig, ax = plt.subplots(figsize=ROUTE_FIGSIZE)
+        fig.suptitle(
+            f'Route Comparison — {self._label}',
+            fontsize=FONT_SUPTITLE, fontweight='bold')
+
+        ax.plot(gt_x, gt_y,
+                color=COLOR_GT, linewidth=LW_GT,
+                label='Ground truth', zorder=3)
+        ax.plot(est_x, est_y,
+                color=COLOR_EST, linewidth=LW_EST, linestyle='--',
+                label=f'/odometry/local  ({self._label})', zorder=2)
+        ax.scatter([0], [0],
+                   color=COLOR_START, s=80, zorder=5, label='Start')
+
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        ax.set_title('2D Trajectory', fontsize=FONT_AX_TITLE)
+        ax.legend()
+        ax.grid(True, color=COLOR_GRID, alpha=GRID_ALPHA)
+        ax.set_aspect('equal')
+        plt.tight_layout()
+
+        path = f'{OUTPUT_DIR}/odom_route_{self._label}_{stamp}.png'
+        fig.savefig(path, dpi=FIGURE_DPI, bbox_inches='tight')
+        plt.close(fig)
+        self.get_logger().info(f"Route plot → {path}")
+
+    # ── error over time ───────────────────────────────────────────────────────
+
+    def _save_error_plot(self, ts_est, errors, mean_err, rmse, stamp):
+        fig, ax = plt.subplots(figsize=ERROR_FIGSIZE)
+        fig.suptitle(
+            f'Position Error — {self._label}',
+            fontsize=FONT_SUPTITLE, fontweight='bold')
+
+        ax.plot(ts_est, errors,
+                color=COLOR_ERROR, linewidth=LW_ERROR,
+                label='Position error', zorder=3)
+        ax.axhline(mean_err,
+                   color=COLOR_MEAN, linestyle='--', linewidth=LW_STAT,
+                   label=f'Mean  {mean_err:.2f} m', zorder=2)
+        ax.axhline(rmse,
+                   color=COLOR_RMSE, linestyle=':', linewidth=LW_STAT,
+                   label=f'RMSE  {rmse:.2f} m', zorder=2)
+
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('Error (m)')
+        ax.set_title('Position Error over Time', fontsize=FONT_AX_TITLE)
+        ax.set_ylim(ERROR_YMIN, ERROR_YMAX)
+        ax.legend()
+        ax.grid(True, color=COLOR_GRID, alpha=GRID_ALPHA)
+        plt.tight_layout()
+
+        path = f'{OUTPUT_DIR}/odom_error_{self._label}_{stamp}.png'
+        fig.savefig(path, dpi=FIGURE_DPI, bbox_inches='tight')
+        plt.close(fig)
+        self.get_logger().info(f"Error plot → {path}")
+
+    # ── CSV ──────────────────────────────────────────────────────────────────
+
+    def _save_csv(self, ts_est, gt_xi, gt_yi, est_x, est_y, errors, stamp):
+        path = f'{OUTPUT_DIR}/odom_accuracy_{self._label}_{stamp}.csv'
+        with open(path, 'w') as f:
+            f.write('time,gt_x,gt_y,est_x,est_y,error\n')
+            for i in range(len(ts_est)):
+                f.write(f"{ts_est[i]:.3f},{gt_xi[i]:.4f},{gt_yi[i]:.4f},"
+                        f"{est_x[i]:.4f},{est_y[i]:.4f},{errors[i]:.4f}\n")
+        self.get_logger().info(f"CSV        → {path}")
 
 def main():
     rclpy.init()

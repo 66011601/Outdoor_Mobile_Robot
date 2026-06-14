@@ -86,7 +86,10 @@ controller_server:
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
       required_movement_radius: 0.5
-      movement_time_allowance: 10.0
+      # After this many seconds without 0.5m progress, declare stuck →
+      # BT triggers recovery → if all recoveries fail, waypoint is skipped
+      # (stop_on_failure: false in waypoint_follower keeps the mission going)
+      movement_time_allowance: 15.0
     # Goal checker parameters
     #precise_goal_checker:
     #  plugin: "nav2_controller::SimpleGoalChecker"
@@ -96,28 +99,34 @@ controller_server:
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.25
-      yaw_goal_tolerance: 0.25
+      # 1.5m: robot declares "arrived" when within this range.
+      # Handles goals placed inside/near obstacles — robot gets close, triggers
+      # success, and waypoint follower advances to the next point.
+      # Also matches GPS accuracy (~1-3m) so no real precision is lost.
+      xy_goal_tolerance: 1.5
+      # Don't require the robot to align heading at each GPS waypoint
+      yaw_goal_tolerance: 3.14
     # DWB parameters
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: True
       min_vel_x: 0.0
       min_vel_y: 0.0
-      max_vel_x: 5.2
+      # Reduced from 5.2: at 5.2 m/s the 8.84m simulated trajectory extends
+      # beyond the 7m (3.5m radius) costmap — obstacles ahead are invisible.
+      # At 1.5 m/s: sim_time 1.7s × 1.5 = 2.55m trajectory → fits comfortably.
+      max_vel_x: 1.5
       max_vel_y: 0.0
-      max_vel_theta: 2.0
+      max_vel_theta: 1.0
       min_speed_xy: 0.0
-      max_speed_xy: 5.2
+      max_speed_xy: 1.5
       min_speed_theta: 0.0
-      # Add high threshold velocity for turtlebot 3 issue.
-      # https://github.com/ROBOTIS-GIT/turtlebot3_simulations/issues/75
-      acc_lim_x: 5.0
+      acc_lim_x: 2.5
       acc_lim_y: 0.0
-      acc_lim_theta: 6.4
-      decel_lim_x: -5.0
+      acc_lim_theta: 3.2
+      decel_lim_x: -2.5
       decel_lim_y: 0.0
-      decel_lim_theta: -6.4
+      decel_lim_theta: -3.2
       vx_samples: 20
       vy_samples: 5
       vtheta_samples: 20
@@ -125,12 +134,14 @@ controller_server:
       linear_granularity: 0.05
       angular_granularity: 0.025
       transform_tolerance: 0.2
-      xy_goal_tolerance: 0.25
-      trans_stopped_velocity: 0.50
+      xy_goal_tolerance: 1.5
+      trans_stopped_velocity: 0.25
       short_circuit_trajectory_evaluation: True
       stateful: True
       critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
-      BaseObstacle.scale: 0.02
+      # Raised from 0.02: BaseObstacle penalises proximity to obstacles.
+      # At 0.02 vs PathDist 32.0 the robot barely cared about hitting things.
+      BaseObstacle.scale: 0.5
       PathAlign.scale: 32.0
       PathAlign.forward_point_distance: 0.1
       GoalAlign.scale: 24.0
@@ -146,7 +157,7 @@ local_costmap:
   local_costmap:
     ros__parameters:
       use_sim_time: True
-      update_frequency: 5.0
+      update_frequency: 10.0
       publish_frequency: 2.0
       global_frame: odom
       robot_base_frame: base_link
@@ -155,37 +166,60 @@ local_costmap:
       height: 7
       resolution: 0.05
       robot_radius: 1.00
-      plugins: ["obstacle_layer", "inflation_layer"]
-      inflation_layer:
-        plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 0.5
-        inflation_radius: 3.0
-      obstacle_layer:
-        plugin: "nav2_costmap_2d::ObstacleLayer"
+      plugins: ["stvl_layer", "denoise_layer", "inflation_layer"]
+      stvl_layer:
+        plugin: "spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer"
         enabled: True
+        # Voxels decay after this many seconds. Short decay is critical for VIO:
+        # if the odom frame drifts slightly, old obstacle marks fade rather than
+        # accumulating at wrong positions and blocking the robot.
+        # Increased from 3.0: exponential decay at 3s fades obstacles in ~9s.
+        # A slow robot can take longer than that to clear an obstacle, making
+        # it disappear as "free" before the robot has actually passed.
+        voxel_decay: 2.0
+        decay_model: 0             # 0=linear — predictable, easier to reason about
+        voxel_size: 0.05           # matches costmap resolution
+        track_unknown_space: true
+        unknown_threshold: 15
+        mark_threshold: 0
+        update_footprint_enabled: True
+        combination_method: 1      # 1=max cost wins across layers
+        origin_z: 0.0
+        z_resolution: 0.05
+        z_voxels: 20               # 20 × 0.05 = 1.0 m height band tracked
+        max_obstacle_height: 2.0
+        min_obstacle_height: 0.0
         observation_sources: scan depth_obstacles
         scan:
+          data_type: LaserScan
           topic: /lidar/scan
+          marking: true
+          clearing: true
+          obstacle_range: 6.0
+          raytrace_range: 7.0
+          min_obstacle_height: 0.0
           max_obstacle_height: 2.0
-          clearing: True
-          marking: True
-          data_type: "LaserScan"
-          raytrace_max_range: 7.0
-          raytrace_min_range: 0.0
-          obstacle_max_range: 6.0
-          obstacle_min_range: 0.0
+          inf_is_valid: false
         depth_obstacles:
+          data_type: PointCloud2
           topic: /camera/depth/obstacles
+          marking: true
+          clearing: true
+          obstacle_range: 3.0
+          raytrace_range: 4.0
           min_obstacle_height: 0.1
           max_obstacle_height: 2.0
-          clearing: True
-          marking: True
-          data_type: "PointCloud2"
-          raytrace_max_range: 4.0
-          raytrace_min_range: 0.0
-          obstacle_max_range: 3.0
-          obstacle_min_range: 0.3
-          observation_persistence: 1.5
+          voxel_filter: true
+          clear_after_reading: true
+      denoise_layer:
+        plugin: "nav2_costmap_2d::DenoiseLayer"
+        enabled: True
+        minimal_group_size: 2      # remove lone-pixel noise, keep real obstacles
+        group_connectivity_type: 8 # 8-connected: diagonals count as same cluster
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        inflation_radius: 1.5
       always_send_full_costmap: True
 
 # GPS WPF CHANGE: Remove static layer
@@ -328,10 +362,10 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [10.2, 0.0, 4.0]
-    min_velocity: [-10.2, 0.0, -4.0]
-    max_accel: [5.0, 0.0, 6.4]
-    max_decel: [-5.0, 0.0, -6.4]
+    max_velocity: [1.5, 0.0, 1.0]
+    min_velocity: [-1.5, 0.0, -1.0]
+    max_accel: [2.5, 0.0, 3.2]
+    max_decel: [-2.5, 0.0, -3.2]
     odom_topic: "odometry/local"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]

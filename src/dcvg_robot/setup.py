@@ -35,6 +35,13 @@ setup(
             'osm_route_generator = dcvg_robot.osm_route_generator:main',
             'osm_route_app = dcvg_robot.osm_route_app:main',
             'odom_accuracy_plot = dcvg_robot.odom_accuracy_plot:main',
+            'odom_reset_node = dcvg_robot.odom_reset_node:main',
+            'feature_overlay = dcvg_robot.feature_overlay:main',
+            'geometric_route_runner = dcvg_robot.geometric_route_runner:main',
+            'route_recorder = dcvg_robot.route_recorder:main',
+            'recorded_route_runner = dcvg_robot.recorded_route_runner:main',
+            'replot_vio = dcvg_robot.replot_vio:main',
+            'stereo_feature_overlay = dcvg_robot.stereo_feature_overlay:main',
         ],
     },
 )

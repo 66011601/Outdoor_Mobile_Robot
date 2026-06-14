@@ -20,7 +20,7 @@ route:
   # NOTE: 'raceway' highway type is excluded from ALL standard network types.
   # Use custom_filter below for Sonoma Raceway simulation.
   # -----------------------------------------------------------------------
-  network_type: walk
+  network_type: none
 
   # -----------------------------------------------------------------------
   # custom_filter: Overpass QL filter to select specific OSM highway types.

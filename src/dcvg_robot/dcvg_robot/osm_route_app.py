@@ -471,7 +471,7 @@ body{font-family:system-ui,sans-serif;font-size:13px;display:flex;height:100vh;o
     <div class="section">
       <div class="sec-title">Config</div>
       <div class="row"><label>Network type</label>
-        <select id="cfg-network" onchange="onNetworkChange()"><option value="walk">walk</option><option value="bike">bike</option><option value="drive">drive</option><option value="drive_service">drive_service</option><option value="all">all</option><option value="all_private">all_private</option><option value="none">none (straight line)</option></select>
+        <select id="cfg-network" onchange="onNetworkChange()"><option value="none">none (straight line)</option><option value="walk">walk</option><option value="bike">bike</option><option value="drive">drive</option><option value="drive_service">drive_service</option><option value="all">all</option><option value="all_private">all_private</option></select>
       </div>
       <div class="row"><label>Max gap (m)</label>
         <input type="number" id="cfg-gap" value="25" step="0.5" min="1"/>
@@ -1435,6 +1435,16 @@ setInterval(async () => {
         const bounds = L.latLngBounds(stops.map(s => [s.lat, s.lon]));
         map.fitBounds(bounds, {padding:[80,80], maxZoom:16});
       }
+    }
+  } catch {}
+
+  // Fetch robot pose once on load — shows marker immediately if robot is active
+  try {
+    const r = await fetch('/api/robot_pose');
+    const d = await r.json();
+    if (d.available) {
+      updateRobotOnMap(d.lat, d.lon, d.heading);
+      status(`Robot active at ${d.lat.toFixed(6)}, ${d.lon.toFixed(6)}`, 'ok');
     }
   } catch {}
 
