@@ -131,7 +131,7 @@ def generate_launch_description():
                 'GFTT/MinDistance':          '10',
                 'Vis/CorFlowMaxLevel':       '5',
                 'OdomF2M/BundleAdjustment':  '0',
-                'Odom/ResetCountdown':       '15',
+                'Odom/ResetCountdown':       '10',
                 'OdomF2M/MaxSize':           '1000',
             }],
             remappings=[

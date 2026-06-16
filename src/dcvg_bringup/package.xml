@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>dcvg_bringup</name>
+  <version>0.0.0</version>
+  <description>Real-hardware bringup for the DCVG autonomous rover (sensors + MAVROS + VIO + EKF + Nav2). dcvg_robot is the simulation counterpart.</description>
+  <maintainer email="66011601@kmitl.ac.th">thana</maintainer>
+  <license>TODO: License declaration</license>
+
+  <!-- Shared navigation/localization stack (same as simulation) -->
+  <depend>navigation2</depend>
+  <depend>nav2_bringup</depend>
+  <depend>robot_localization</depend>
+  <depend>robot_state_publisher</depend>
+  <depend>xacro</depend>
+
+  <!-- VIO + depth obstacles -->
+  <depend>rtabmap_odom</depend>
+  <depend>rtabmap_util</depend>
+
+  <!-- Real sensor drivers (installed on the Jetson) -->
+  <exec_depend>realsense2_camera</exec_depend>
+  <exec_depend>rplidar_ros</exec_depend>
+  <exec_depend>mavros</exec_depend>
+  <exec_depend>mavros_extras</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

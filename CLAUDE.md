@@ -1,118 +1,161 @@
 # DCVG Autonomous Rover Project
 
 ## Project Overview
-Converting a Chinese grass-cutting robot into a large autonomous outdoor rover for DCVG (Direct Current Voltage Gradient) pipeline inspection. The robot navigates outdoors using GPS waypoints with 2D LiDAR obstacle avoidance, following OSM (OpenStreetMap) routes. Built on ROS2 Humble with Gazebo Classic simulation.
+Converting a Chinese grass-cutting robot into a large autonomous outdoor rover for DCVG (Direct Current Voltage Gradient) pipeline inspection. The robot navigates outdoors using GPS waypoints, following OSM (OpenStreetMap) routes, with obstacle avoidance from a 2D LiDAR + a depth camera. Localization is **GPS + Visual-Inertial Odometry (VIO)** — the real robot has no wheel encoders. Built on ROS2 Humble.
 
-## Current Status — What Works
-- GPS waypoint navigation with Nav2 (fully functional in simulation)
-- 2D LiDAR obstacle avoidance via Nav2 costmap
-- Dual EKF + navsat_transform sensor fusion (robot_localization)
-- OSM route planning with web-based control app (Flask on port 5000)
-- GPS waypoint logging and interactive waypoint following
-- Mapviz and RViz2 visualization
-- Custom robot model with STL mesh
-- Simulation runs on Gazebo Classic (gazebo11) with sonoma_raceway world
+## Package Layout & Intent (read this first)
+This workspace separates **simulation** from **real hardware**:
 
-## Next Phase — What We're Adding
-Integrating Intel RealSense D455 depth camera with RTAB-Map for:
-1. **Visual-Inertial Odometry (VIO)** — replaces missing wheel encoders on real hardware
-2. **Enhanced obstacle detection** — RTAB-Map's depth-based obstacle detection with ground plane removal solves the "LiDAR sees grass as walls" problem
-3. **RTAB-Map handles both VIO and obstacles** (Option A — simpler, fewer nodes)
+- **`dcvg_robot` = SIMULATION ONLY.** Gazebo Classic world, robot model/URDF, Gazebo sensor plugins, and the sim entry-point launch. Sensor data here comes from Gazebo plugins. Use this to develop and validate the navigation/localization stack without hardware.
+- **`dcvg_bringup` = REAL-HARDWARE bringup (scaffolded).** Brings up the *real* sensor drivers (RealSense, RPLIDAR, MAVROS, GPS) and reuses the same downstream stack. Self-contained: it carries its own copies of the EKF/Nav2 configs + behavior trees (with `use_sim_time=False`) so it can diverge from sim freely. Everything outside `dcvg_robot` targets real hardware.
 
-## Architecture
+The **shared middle layer is reused across both** — only the sensor *sources* differ:
 
-### Current (working)
 ```
-2D LiDAR (/scan) ──────────────────→ Nav2 costmap (obstacle layer)
-GPS (/gps/fix) → navsat_transform → /odometry/gps → ekf_global
-Wheel odom (/odom) ─────────────────→ ekf_local + ekf_global
-IMU (/imu/data) ────────────────────→ ekf_local + ekf_global
+            SIM (dcvg_robot)                 REAL HW (bringup pkg, planned)
+            Gazebo plugins                   realsense2_camera / rplidar_ros /
+                  │                          MAVROS / GPS driver
+                  ▼                                   │
+   ┌──────────────────────────── SHARED ─────────────▼──────────────┐
+   │  RTAB-Map (rgbd/stereo VIO  →  /vo)  +  obstacles_detection      │
+   │  robot_localization (dual EKF + navsat_transform)                │
+   │  Nav2 (nav2_bringup, no-map rolling costmap)                     │
+   └──────────────────────────────────────────────────────────────── ┘
+```
+When building the real-hardware bringup, **reuse** `dual_ekf_navsat_params.yaml`, `nav2_no_map_params.yaml`, the RTAB-Map node config, and the behavior trees. **Replace** only the Gazebo-specific launch (`gazebo_gps_world.launch.py`) and the Gazebo `diff_drive` plugin (→ MAVROS `cmd_vel`).
+
+## Current Status — What Works (in simulation, `dcvg_robot`)
+- GPS waypoint navigation with Nav2 (no static map, rolling costmap)
+- Obstacle avoidance fusing **2D LiDAR + depth-camera obstacle cloud** in the Nav2 costmap
+- **VIO via RTAB-Map** publishing `/vo`, consumed by `robot_localization` (wheel odometry removed)
+- Dual EKF + navsat_transform sensor fusion (robot_localization)
+- Depth-based obstacle detection with **ground-plane removal** (solves "LiDAR sees grass as walls")
+- OSM route planning with web-based control app (Flask on port 5000)
+- Route recording / playback and OSM route following
+- Custom recovery behavior trees (BackUp before Spin)
+- Mapviz and RViz2 visualization; custom robot model with STL mesh
+- Simulation on Gazebo Classic (gazebo11), sonoma_raceway worlds
+
+### Already migrated to VIO (done — was the previous "next phase")
+- Forward/inverse kinematics, wheel-odometry, and DCVG controller nodes **removed** (no longer in `setup.py`)
+- Gazebo `diff_drive` plugin kept *only* to move the robot from `/cmd_vel`; it no longer publishes odom or odom→base_footprint TF (`publish_odom=false`, `publish_odom_tf=false`)
+- EKF now fuses `/vo` (local) + GPS (global) + IMU — see `dual_ekf_navsat_params.yaml`
+- Nav2 costmap consumes both LiDAR scan and the ground-filtered depth obstacle cloud
+
+## Next Phase — Real-Hardware Bringup
+`dcvg_bringup` is **scaffolded and builds** (launch + config + behavior trees in place).
+The launch graph runs the real sensor drivers + MAVROS, then the same RTAB-Map VIO +
+EKF + Nav2 stack proven in sim. Remaining work before first hardware run:
+1. **Confirm real topic names / device ports** — everything marked TBD in the launch
+   files and the "Sensor Topics" table (RealSense, RPLIDAR serial, MAVROS FCU URL).
+2. **IMU source** — decide camera IMU (+imu_filter_madgwick for orientation) vs Pixhawk
+   IMU from MAVROS; ensure it lands on `/imu/data`.
+3. **cmd_vel → MAVROS bridge** — relay `/cmd_vel` to `/mavros/setpoint_velocity/cmd_vel_unstamped`
+   (commented stub in `mavros.launch.py`).
+4. **HW robot description** — optionally split a Gazebo-free xacro out of `dcvg_robot`
+   (currently `bringup.launch.py` reuses the sim xacro; `<gazebo>` tags are ignored by RSP).
+5. **ArduPilot safety** — RC failsafe, geofence, arm/disarm tested before autonomy.
+
+## Sensor Topics — TO CONFIRM (no hardware yet)
+Real-hardware topic names are **not yet finalized** — confirm here once drivers are connected.
+The sim topic names are what `dcvg_robot` / RTAB-Map / Nav2 currently use.
+
+| Sensor | Sim topic (`dcvg_robot`) | Real-HW topic | Status |
+|---|---|---|---|
+| RGB image | `/d455/image_raw` | TBD | confirm |
+| Depth image | `/d455/depth/image_raw` | TBD | confirm |
+| Camera info | `/d455/camera_info` | TBD | confirm |
+| Depth point cloud | `/d455/points` | TBD | confirm |
+| Stereo IR pair | `/d457/left|right/image_raw` (+info) | TBD | confirm |
+| IMU | `/imu/data` | TBD | confirm |
+| 2D LiDAR scan | `/lidar/scan` | TBD | confirm |
+| GPS fix | `/gps/fix` | TBD | confirm |
+| VIO out (shared) | `/vo` | `/vo` | fixed |
+| Depth obstacles (shared) | `/camera/depth/obstacles` | `/camera/depth/obstacles` | fixed |
+
+> When wiring real drivers, prefer **remapping driver outputs onto the sim topic names above** so the shared RTAB-Map/Nav2 config needs no edits.
+
+## Architecture (current, VIO-based)
+```
+Depth camera (RGB+Depth+IMU) → RTAB-Map rgbd/stereo_odometry → /vo → ekf_local
+                              → obstacles_detection (ground filtered) → /camera/depth/obstacles → Nav2 costmap
+2D LiDAR (scan) ───────────────────────────────────────────────────→ Nav2 costmap
+GPS (fix) → navsat_transform → /odometry/gps ─────────────────────→ ekf_global
+IMU (data) ───────────────────────────────────────────────────────→ ekf_local + ekf_global
 
 robot_localization:
-  ekf_local  → odom → base_footprint (smooth local)
-  ekf_global → map → odom (GPS-corrected)
+  ekf_local  (world=odom): /vo velocity + IMU yaw  → odom → base_footprint (smooth, may drift)
+  ekf_global (world=map):  GPS position + IMU yaw   → map → odom (GPS-anchored, zero drift)
 
-Nav2 → cmd_vel → diff_drive_plugin → robot moves
+Nav2 → /cmd_vel → [SIM: diff_drive plugin] / [REAL: MAVROS] → robot moves
 ```
-
-### Target (after D455 + RTAB-Map integration)
-```
-D455 (RGB + Depth + IMU) → RTAB-Map (odometry mode)
-  ├── /vo (visual odometry) → robot_localization EKF
-  └── obstacle grid (ground filtered) → Nav2 costmap
-
-2D LiDAR (/scan) → Nav2 costmap (long-range 360° backup)
-GPS → navsat_transform → ekf_global
-D455 IMU or Pixhawk IMU → ekf_local + ekf_global
-
-Nav2 costmap sources: LiDAR + RTAB-Map depth obstacles
-```
+Rationale: VIO drifts, GPS does not. VIO lives in `ekf_local` only (smooth interpolation between fixes); the global frame stays GPS-anchored to avoid contaminating it with drift.
 
 ## Workspace Structure
 ```
 ~/internship_project/diff_drive_ws/
 ├── src/
-│   └── dcvg_robot/                          # Main package (Python/ament_python)
-│       ├── package.xml
-│       ├── setup.py
-│       ├── setup.cfg
-│       ├── App.bash                         # Quick-start script (sources + launches web UI)
-│       ├── resource/dcvg_robot
-│       │
-│       ├── urdf/
-│       │   ├── dcvg_robot.urdf.xacro        # Robot description (xacro source)
-│       │   ├── dcvg_robot.urdf              # Generated URDF
-│       │   └── dcvg_robot.sdf               # SDF for Gazebo
-│       │
-│       ├── meshes/
-│       │   └── DCVG_Robot.stl               # Custom 3D mesh
-│       │
-│       ├── models/dcvg_robot/
-│       │   ├── model.config
-│       │   └── dcvg_robot.sdf               # Gazebo model SDF
-│       │
-│       ├── worlds/
-│       │   └── sonoma_raceway.world         # Gazebo Classic world
-│       │
+│   ├── dcvg_robot/                          # SIMULATION package (Python/ament_python)
+│   │   ├── package.xml / setup.py / setup.cfg
+│   │   ├── App.bash                         # Quick-start (sources + launches web UI)
+│   │   ├── resource/dcvg_robot
+│   │   │
+│   │   ├── urdf/
+│   │   │   ├── dcvg_robot.urdf.xacro        # Robot description (xacro source; sensors + diff_drive plugin)
+│   │   │   ├── dcvg_robot.urdf              # Generated URDF
+│   │   │   └── dcvg_robot.sdf               # SDF for Gazebo
+│   │   ├── meshes/DCVG_Robot.stl            # Custom 3D mesh
+│   │   ├── models/dcvg_robot/               # Gazebo model (model.config + dcvg_robot.sdf)
+│   │   ├── worlds/
+│   │   │   ├── sonoma_raceway.world
+│   │   │   └── sonoma_raceway_with_elements.world   # adds obstacles for depth-detection testing
+│   │   │
+│   │   ├── launch/
+│   │   │   ├── gps_waypoint_follower.launch.py  # Main sim entry (chains everything)
+│   │   │   ├── gazebo_gps_world.launch.py       # Gazebo + robot spawn + robot_state_publisher (SIM-ONLY)
+│   │   │   ├── dual_ekf_navsat.launch.py        # robot_localization EKFs (SHARED config)
+│   │   │   ├── rtabmap.launch.py                # RTAB-Map VIO (rgbd/stereo) + obstacles_detection (SHARED config)
+│   │   │   └── mapviz.launch.py                 # Mapviz visualization
+│   │   │
+│   │   ├── config/
+│   │   │   ├── nav2_no_map_params.yaml          # Nav2 (no map, rolling costmap; LiDAR + depth obstacle sources)
+│   │   │   ├── dual_ekf_navsat_params.yaml      # EKF + navsat (odom0=/vo local, GPS global)
+│   │   │   ├── waypoints.yaml / waypoints_ref.yaml / stops.yaml
+│   │   │   ├── vio_test_routes.yaml             # Test routes for VIO evaluation
+│   │   │   ├── osm_route_config.yaml / osm_route_comparison.html
+│   │   │   └── mapviz.mvc / gps_wpf_demo.mvc
+│   │   │
+│   │   ├── behavior_trees/                      # Custom Nav2 recovery BTs (BackUp before Spin)
+│   │   │   ├── navigate_to_pose_w_replanning_and_recovery.xml
+│   │   │   └── navigate_through_poses_w_replanning_and_recovery.xml
+│   │   │
+│   │   ├── rviz/dcvg_env.rviz
+│   │   │
+│   │   └── dcvg_robot/                          # Python nodes
+│   │       ├── __init__.py
+│   │       ├── osm_route_app.py                 # Flask web app for route control
+│   │       ├── osm_route_generator.py           # OSM route planning
+│   │       ├── route_waypoint_follower.py       # Follow OSM routes
+│   │       ├── route_recorder.py                # Record routes
+│   │       ├── recorded_route_runner.py         # Replay recorded routes
+│   │       ├── odom_accuracy_plot.py            # VIO vs ground-truth accuracy plotting
+│   │       ├── feature_overlay.py               # RGBD keypoint overlay (debug)
+│   │       └── stereo_feature_overlay.py        # Stereo keypoint + epipolar overlay (debug)
+│   │
+│   └── dcvg_bringup/                            # REAL-HARDWARE bringup (Python/ament_python)
+│       ├── package.xml / setup.py / setup.cfg
 │       ├── launch/
-│       │   ├── gps_waypoint_follower.launch.py  # Main entry (starts everything)
-│       │   ├── gazebo_gps_world.launch.py       # Gazebo + robot spawn
-│       │   ├── dual_ekf_navsat.launch.py        # robot_localization EKFs
-│       │   ├── bringup.launch.py                # Robot state publisher
-│       │   └── mapviz.launch.py                 # Mapviz visualization
-│       │
-│       ├── config/
-│       │   ├── nav2_no_map_params.yaml          # Nav2 params (no static map, rolling costmap)
-│       │   ├── dual_ekf_navsat_params.yaml      # EKF + navsat config
-│       │   ├── waypoints.yaml                   # Stored GPS waypoints
-│       │   ├── waypoints_ref.yaml               # Reference waypoints
-│       │   ├── stops.yaml                       # Stop points
-│       │   ├── osm_route_config.yaml            # OSM route parameters
-│       │   ├── osm_route_comparison.html        # Route comparison view
-│       │   ├── mapviz.mvc                       # Mapviz config
-│       │   └── gps_wpf_demo.mvc                 # Mapviz GPS demo config
-│       │
-│       ├── rviz/
-│       │   └── dcvg_env.rviz                    # RViz2 config
-│       │
-│       └── dcvg_robot/                          # Python nodes
-│           ├── __init__.py
-│           ├── osm_route_app.py                 # Flask web app for route control
-│           ├── osm_route_generator.py           # OSM route planning
-│           ├── route_waypoint_follower.py        # Follow OSM routes
-│           ├── logged_waypoint_follower.py       # Follow logged waypoints
-│           ├── interactive_waypoint_follower.py  # Interactive waypoint mode
-│           ├── gps_waypoint_logger.py           # Log GPS positions
-│           ├── dcvg_controller.py               # DCVG-specific control
-│           ├── forward_kinematics.py            # FK calculations
-│           ├── inverse_kinematics.py            # IK calculations
-│           └── odom.py                          # Odometry processing
-├── build/
-├── install/
-└── log/
+│       │   ├── bringup.launch.py                # Top-level real-HW entry (chains all below + Nav2)
+│       │   ├── sensors.launch.py                # RealSense + RPLIDAR drivers (topics/ports TBD)
+│       │   ├── mavros.launch.py                 # Pixhawk bridge: GPS in, cmd_vel out (URL TBD)
+│       │   ├── localization.launch.py           # dual EKF + navsat (use_sim_time=False)
+│       │   └── rtabmap.launch.py                # VIO + obstacles (use_sim_time=False; camera topics as args)
+│       ├── config/                              # own copies of nav2 + EKF params (sim-time flipped to False)
+│       └── behavior_trees/                      # own copies of the recovery BTs
+├── build/ install/ log/
 ```
 
-## How to Run
+## How to Run (simulation)
 
 ### Simulation + Navigation (one command)
 ```bash
@@ -126,79 +169,78 @@ ros2 launch dcvg_robot gps_waypoint_follower.launch.py
 ./App.bash
 # Or manually:
 source ~/internship_project/diff_drive_ws/install/setup.bash
-ros2 run dcvg_robot osm_route_app
-# Opens http://127.0.0.1:5000
+ros2 run dcvg_robot osm_route_app          # http://127.0.0.1:5000
 ```
 
-### With visualization
+### With visualization / stereo VIO
 ```bash
 ros2 launch dcvg_robot gps_waypoint_follower.launch.py use_rviz:=True
 ros2 launch dcvg_robot gps_waypoint_follower.launch.py use_mapviz:=True
+ros2 launch dcvg_robot rtabmap.launch.py use_stereo:=true   # D457 IR stereo instead of D455 RGBD
 ```
 
-## Launch Flow
-`gps_waypoint_follower.launch.py` is the single entry point. It chains:
-1. `gazebo_gps_world.launch.py` → Gazebo Classic + robot spawn + robot_state_publisher
-2. `dual_ekf_navsat.launch.py` → ekf_local + ekf_global + navsat_transform
-3. `nav2_bringup/navigation_launch.py` → full Nav2 stack (uses nav2_bringup, NOT individual nodes)
-4. Optionally: RViz2, Mapviz
+## Launch Flow (sim)
+`gps_waypoint_follower.launch.py` is the single sim entry point. It chains:
+1. `gazebo_gps_world.launch.py` → Gazebo Classic + robot spawn + robot_state_publisher  *(SIM-ONLY; replaced on real HW)*
+2. `dual_ekf_navsat.launch.py` → ekf_local + ekf_global + navsat_transform  *(SHARED)*
+3. `rtabmap.launch.py` → RTAB-Map VIO (`/vo`) + obstacles_detection (`/camera/depth/obstacles`)  *(SHARED config)*
+4. `nav2_bringup/navigation_launch.py` → full Nav2 stack, pointed at the custom behavior trees  *(SHARED)*
+5. Optionally: RViz2, Mapviz
 
 ## Key Technical Decisions
-- **Gazebo Classic (gazebo11)** — based on nav2_gps_waypoint_follower_demo tutorial. Uses Classic plugins (libgazebo_ros_*), NOT Gazebo Sim/Harmonic.
-- **nav2_bringup** — uses the standard nav2_bringup navigation_launch.py (not individual Nav2 nodes)
-- **ArduPilot Rover, NOT PX4** — Pixhawk 2.4.8 is FMUv3, PX4 dropped support
-- **MAVROS for real hardware** — ROS2 ↔ Pixhawk bridge (not needed in simulation)
-- **No static map** — outdoor GPS navigation with rolling costmaps only
-- **RTAB-Map for VIO** — replaces wheel encoders (real robot has none). Run in odometry-only mode, NOT full SLAM
-- **RTAB-Map for obstacle detection** — depth-based with ground plane removal, solves grass-as-obstacle problem
-- **RPLIDAR S2 for 2D LiDAR** — dToF, 30m range, IP65, 80K lux sunlight, ~$200-350 (better AND cheaper than A3)
-- **YOLOv8-seg traversability** — future phase: classify grass vs real obstacles in Nav2 costmap (based on ICRA 2024 paper arxiv 2407.18535)
+- **`dcvg_robot` is sim-only; real HW bringup is a separate package** — keep the boundary clean.
+- **Gazebo Classic (gazebo11)** — Classic plugins (`libgazebo_ros_*`), NOT Gazebo Sim/Harmonic.
+- **nav2_bringup** — standard `navigation_launch.py` (not individual Nav2 nodes).
+- **RTAB-Map for VIO** — odometry-only mode (NOT full SLAM); replaces missing wheel encoders.
+- **RTAB-Map for obstacle detection** — depth-based with ground-plane removal (height-segmentation in sim, since Gazebo depth has no normals).
+- **RGBD vs stereo VIO** — `rtabmap.launch.py use_stereo:=` switches D455 RGBD (≤6 m) vs D457 IR stereo (passive, sunlight-immune, ~15 m). Pick the real-HW default deliberately.
+- **ArduPilot Rover, NOT PX4** — Pixhawk 2.4.8 is FMUv3; PX4 dropped support.
+- **MAVROS for real hardware** — ROS2 ↔ Pixhawk bridge; replaces the Gazebo diff_drive plugin.
+- **No static map** — outdoor GPS navigation with rolling costmaps only.
+- **RPLIDAR S2 for 2D LiDAR** — dToF, 30 m, IP65, sunlight-resistant.
+- **YOLOv8-seg traversability** — future phase: classify grass vs real obstacles (ICRA 2024, arxiv 2407.18535).
 
-## Hardware (for real deployment, not simulation focus now)
-- **Intel RealSense D455** — depth camera + built-in IMU for VIO (~$300)
-  - 95mm baseline (accurate depth to 6m), global shutter (no motion blur), BMI270 IMU
-- **RPLIDAR S2** — 2D LiDAR, 360°, 30m, 32K samples/sec, IP65, sunlight-resistant
-- **Pixhawk 2.4.8** — ArduRover firmware, motor control + RC failsafe + GPS/IMU
-- **Jetson Orin Nano** — companion computer (runs ROS2 Humble natively, no Docker needed)
-- **u-blox NEO-M8N GPS ×2** — connected to Pixhawk
-- **FS-iA10B RC receiver** — safety kill-switch via Pixhawk
-- **Pololu G2 Motor Drivers ×2** — driven by Pixhawk PWM
-- **Not using:** Arduino (not needed), TFmini Plus (D455 replaces it)
+## Hardware (real deployment)
+- **Intel RealSense D455/D457** — depth + IMU for VIO. D455: 95 mm baseline, depth 0.6–6 m, BMI270 IMU. D457: IR stereo pair, passive (sunlight-immune), longer range.
+- **RPLIDAR S2** — 2D LiDAR, 360°, 30 m, IP65, sunlight-resistant.
+- **Jetson Orin Nano** — companion computer (ROS2 Humble native, no Docker).
+- **simpleRTK2B Heading** — RTK GPS module handle all data about GPS
+- **Realsense D457 Depth Camera** — Stereo Depth Camera for visual odometry
+- **Pololu G2 Motor Drivers ×2** — driven by Pixhawk PWM.
+- **Not using:** Arduino, TFmini Plus (D455 replaces it).
 
 ## Software Stack
-- **OS:** Ubuntu 22.04
-- **ROS2:** Humble
+- **OS:** Ubuntu 22.04 — **ROS2:** Humble
 - **Simulation:** Gazebo Classic (gazebo11) — NOT Gazebo Sim/Harmonic
-- **Navigation:** Nav2 (via nav2_bringup) with no-map rolling costmap
+- **Navigation:** Nav2 (via nav2_bringup), no-map rolling costmap
 - **Localization:** robot_localization (dual EKF + navsat_transform)
-- **VIO (adding next):** RTAB-Map (`sudo apt install ros-humble-rtabmap-ros`)
-- **Depth obstacles (adding next):** RTAB-Map obstacle detection with ground filtering
-- **2D LiDAR driver (real hardware):** rplidar_ros (`sudo apt install ros-humble-rplidar-ros`)
-- **Camera driver (real hardware):** realsense2_camera (`sudo apt install ros-humble-realsense2-camera`)
-- **Visualization:** RViz2, Mapviz
-- **Control:** Flask web app + OSM route integration
+- **VIO + depth obstacles:** RTAB-Map (`sudo apt install ros-humble-rtabmap-ros`)
+- **2D LiDAR driver (real HW):** rplidar_ros (`sudo apt install ros-humble-rplidar-ros`)
+- **Camera driver (real HW):** realsense2_camera (`sudo apt install ros-humble-realsense2-camera`)
+- **Pixhawk bridge (real HW):** MAVROS
+- **Visualization:** RViz2, Mapviz — **Control:** Flask web app + OSM route integration
 
 ## Research References
-- **Nav2 GPS waypoint demo:** https://github.com/ros-navigation/navigation2_tutorials/tree/humble/nav2_gps_waypoint_follower_demo (basis for current implementation)
+- **Nav2 GPS waypoint demo:** https://github.com/ros-navigation/navigation2_tutorials/tree/humble/nav2_gps_waypoint_follower_demo
 - **RTAB-Map Stereo Outdoor Navigation:** https://wiki.ros.org/rtabmap_ros/Tutorials/StereoOutdoorNavigation
-- **YOLOv8 Nav2 traversability (ICRA 2024):** arxiv 2407.18535 — "Improving the ROS 2 Navigation Stack with Real-Time Local Costmap Updates for Agricultural Applications"
-- **RAMP-VO:** REJECTED — needs event camera hardware we don't have
-- **TERP DRL Planning:** DEFERRED — ROS1 only, needs 3D LiDAR, requires porting
-- **VLM-GroNav:** DEFERRED — no public code, needs VLM compute too heavy for edge devices
-- **NVIDIA Isaac Perceptor:** BACKUP — available if we need GPU-accelerated perception on Orin
+- **YOLOv8 Nav2 traversability (ICRA 2024):** arxiv 2407.18535
+- **RAMP-VO:** REJECTED — needs event camera hardware
+- **TERP DRL Planning:** DEFERRED — ROS1 only, needs 3D LiDAR
+- **VLM-GroNav:** DEFERRED — no public code, VLM too heavy for edge
+- **NVIDIA Isaac Perceptor:** BACKUP — GPU-accelerated perception on Orin
 
 ## Known Issues & Gotchas
-- conda and ROS2 conflict — never mix them
-- Real robot has no wheel encoders — VIO from D455+RTAB-Map is the replacement
-- Outdoor LiDAR sees grass/weeds as obstacles — D455+RTAB-Map ground filtering solves this
-- GPS provides ~1-3m accuracy — Nav2 goal tolerance set to 1m to match
-- D455 depth range maxes out at ~6m outdoors — RPLIDAR S2 (30m) covers long range
-- This workspace uses Gazebo Classic (gazebo11) — do NOT use Gazebo Sim/Harmonic plugins
-- Gazebo Classic uses plugins like libgazebo_ros_diff_drive.so, libgazebo_ros_ray_sensor.so, etc.
-- When deploying to Jetson Orin Nano: swap diff-drive for MAVROS cmd_vel bridge
-- The project uses ament_python build type (setup.py), NOT ament_cmake (CMakeLists.txt)
+- conda and ROS2 conflict — never mix them.
+- Real robot has no wheel encoders — VIO from depth-camera + RTAB-Map is the replacement.
+- Outdoor LiDAR sees grass/weeds as obstacles — depth + ground filtering solves this.
+- GPS provides ~1–3 m accuracy — Nav2 goal tolerance set to ~1 m to match.
+- Depth range maxes ~6 m outdoors (RGBD) — RPLIDAR S2 (30 m) covers long range.
+- `dcvg_robot` uses Gazebo Classic — do NOT use Gazebo Sim/Harmonic plugins.
+- On real HW: swap the Gazebo diff_drive plugin for a MAVROS `cmd_vel` bridge.
+- `dcvg_robot` is ament_python (setup.py), NOT ament_cmake.
+- Real-hardware sensor topic names are still TBD — see the "Sensor Topics — TO CONFIRM" table.
 
-## Safety Requirements (for real hardware phase)
+## Safety Requirements (real hardware phase)
 - RC failsafe configured before first outdoor autonomous test
 - Geofence configured in ArduPilot
 - Always have RC kill-switch accessible during outdoor testing

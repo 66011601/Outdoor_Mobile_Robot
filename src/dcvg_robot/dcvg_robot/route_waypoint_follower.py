@@ -37,6 +37,7 @@ from nav2_gps_waypoint_follower_demo.utils.gps_utils import quaternion_from_eule
 _NAV_CMD_FILE      = '/tmp/dcvg_nav_cmd'
 _STOP_STATUS_FILE  = '/tmp/dcvg_stop_status'
 _STOP_CONFIRM_FILE = '/tmp/dcvg_stop_confirm'
+_NAV_TARGET_FILE   = '/tmp/dcvg_nav_target'   # current goal the robot is driving to
 
 
 def _read_cmd():
@@ -55,6 +56,25 @@ def _write_cmd(cmd):
 def _write_stop_status(msg: str):
     with open(_STOP_STATUS_FILE, 'w') as f:
         f.write(msg)
+
+
+def _write_nav_target(orig_idx: int, seq: int, total: int, lat: float, lon: float):
+    """Tell the web app which waypoint the robot is currently driving to.
+
+    orig_idx — index into the full waypoints.yaml list (matches the app's array)
+    seq/total — human-readable progress (waypoint seq of total, after filtering)
+    """
+    import json
+    with open(_NAV_TARGET_FILE, 'w') as f:
+        json.dump({'index': orig_idx, 'seq': seq, 'total': total,
+                   'latitude': lat, 'longitude': lon}, f)
+
+
+def _clear_nav_target():
+    try:
+        os.remove(_NAV_TARGET_FILE)
+    except FileNotFoundError:
+        pass
 
 
 def _check_file_confirm() -> bool:
@@ -289,6 +309,7 @@ class RouteWaypointFollower(Node):
             poses[i][1].pose.orientation = quaternion_from_euler(0.0, 0.0, yaw)
 
         _write_cmd('run')
+        _clear_nav_target()   # drop any stale target from a previous run
         self.get_logger().info(
             f"Starting navigation: {len(poses)} waypoints, {len(self.stops)} stop(s)")
 
@@ -300,6 +321,7 @@ class RouteWaypointFollower(Node):
             while True:
                 cmd = _read_cmd()
                 if cmd == 'stop':
+                    _clear_nav_target()
                     self.get_logger().info("Navigation stopped.")
                     return
                 if cmd == 'pause':
@@ -309,6 +331,11 @@ class RouteWaypointFollower(Node):
 
             self.get_logger().info(f"→ Waypoint {j + 1}/{len(poses)}"
                                    + (" [STOP ahead]" if orig_idx in self.stops else ""))
+            # Publish the current target so the web app can highlight it.
+            # orig_idx maps to the same waypoints.yaml the app loaded.
+            twp = self.waypoints[orig_idx]
+            _write_nav_target(orig_idx, j + 1, len(poses),
+                              float(twp['latitude']), float(twp['longitude']))
             self.navigator.goToPose(pose)
 
             # --- Monitor until waypoint reached or command received ---
@@ -318,6 +345,7 @@ class RouteWaypointFollower(Node):
 
                 if cmd == 'stop':
                     self.navigator.cancelTask()
+                    _clear_nav_target()
                     self.get_logger().info("Navigation stopped.")
                     return
 
@@ -329,6 +357,7 @@ class RouteWaypointFollower(Node):
                         rclpy.spin_once(self, timeout_sec=0.2)
                         cmd = _read_cmd()
                     if cmd == 'stop':
+                        _clear_nav_target()
                         self.get_logger().info("Navigation stopped while paused.")
                         return
                     self.get_logger().info(f"Resumed — re-navigating to waypoint {j + 1}")
@@ -341,10 +370,12 @@ class RouteWaypointFollower(Node):
             if orig_idx in self.stops:
                 outcome = self._wait_at_stop(orig_idx)
                 if outcome == 'stop':
+                    _clear_nav_target()
                     return
 
             j += 1
 
+        _clear_nav_target()
         self.get_logger().info("All waypoints reached!")
         _write_cmd('stopped')
 

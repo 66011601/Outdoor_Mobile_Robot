@@ -15,8 +15,19 @@ def generate_launch_description():
 
     launch_dir = os.path.join(pkg, 'launch')
     nav2_params = os.path.join(pkg, 'config', 'nav2_no_map_params.yaml')
+    bt_dir = os.path.join(pkg, 'behavior_trees')
+
+    # Point bt_navigator at our custom recovery BTs (BackUp before Spin).
+    # These paths are install-specific so they are injected here, not in the yaml.
+    param_substitutions = {
+        'default_nav_to_pose_bt_xml': os.path.join(
+            bt_dir, 'navigate_to_pose_w_replanning_and_recovery.xml'),
+        'default_nav_through_poses_bt_xml': os.path.join(
+            bt_dir, 'navigate_through_poses_w_replanning_and_recovery.xml'),
+    }
     configured_params = RewrittenYaml(
-        source_file=nav2_params, root_key='', param_rewrites='', convert_types=True,
+        source_file=nav2_params, root_key='',
+        param_rewrites=param_substitutions, convert_types=True,
     )
 
     use_rviz = LaunchConfiguration('use_rviz')

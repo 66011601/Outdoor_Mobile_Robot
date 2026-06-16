@@ -17,21 +17,37 @@ import yaml
 _NAV_CMD_FILE      = '/tmp/dcvg_nav_cmd'
 _STOP_STATUS_FILE  = '/tmp/dcvg_stop_status'
 _STOP_CONFIRM_FILE = '/tmp/dcvg_stop_confirm'
+_NAV_TARGET_FILE   = '/tmp/dcvg_nav_target'   # current goal published by route_waypoint_follower
 _nav_proc = None
 _nav_state = 'stopped'  # 'stopped' | 'running' | 'paused'
 
 # ---------------------------------------------------------------------------
 # Robot pose monitoring (background ROS2 subscriber thread)
 # ---------------------------------------------------------------------------
-_robot_pose = {'available': False, 'lat': 0.0, 'lon': 0.0, 'heading': 0.0}
+_robot_pose = {'available': False, 'lat': 0.0, 'lon': 0.0, 'heading': 0.0,
+               'lin': 0.0, 'ang': 0.0}
+
+# Latest camera frame (JPEG bytes) for the monitoring screen. We only encode
+# frames while a viewer is connected (want_ts kept fresh by the stream endpoint).
+_CAMERA_TOPIC = '/d455/image_raw'
+_camera = {'jpeg': None, 'ts': 0.0, 'want_ts': 0.0}
+
+# ---------------------------------------------------------------------------
+# Manual teleop (publishes /cmd_vel for over-control when nav is paused/stopped)
+# ---------------------------------------------------------------------------
+_TELEOP_DEADMAN_S = 0.5     # stop the robot if no fresh command within this window
+_teleop = {'active': False, 'lin': 0.0, 'ang': 0.0, 'ts': 0.0, 'disengage_at': 0.0}
+_ros = {'cmd_pub': None}    # filled in once the ROS monitor node is up
 
 
 def _start_ros_monitor():
     def _spin():
         try:
+            import time
             import rclpy
             from nav_msgs.msg import Odometry
-            from sensor_msgs.msg import NavSatFix
+            from sensor_msgs.msg import NavSatFix, Image
+            from geometry_msgs.msg import Twist
             rclpy.init()
             node = rclpy.create_node('osm_route_monitor')
 
@@ -46,10 +62,63 @@ def _start_ros_monitor():
                 siny = 2.0 * (q.w * q.z + q.x * q.y)
                 cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
                 _robot_pose['heading'] = _math.atan2(siny, cosy)
+                _robot_pose['lin'] = msg.twist.twist.linear.x
+                _robot_pose['ang'] = msg.twist.twist.angular.z
 
             # Change '/gps/fix' if your GPS topic name differs
             node.create_subscription(NavSatFix, '/gps/fix', gps_cb, 10)
             node.create_subscription(Odometry, '/odometry/local', odom_cb, 10)
+
+            # Camera → JPEG for the monitoring screen. Encoding only runs while a
+            # browser is actually watching the stream (cheap drop otherwise).
+            try:
+                from cv_bridge import CvBridge
+                import cv2
+                _bridge = CvBridge()
+
+                def image_cb(msg):
+                    if time.monotonic() - _camera['want_ts'] > 3.0:
+                        return                      # nobody watching → skip encode
+                    if time.monotonic() - _camera['ts'] < 0.05:
+                        return                      # cap at ~20 fps
+                    try:
+                        cv_img = _bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+                        ok, jpg = cv2.imencode(
+                            '.jpg', cv_img, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                        if ok:
+                            _camera['jpeg'] = jpg.tobytes()
+                            _camera['ts'] = time.monotonic()
+                    except Exception:
+                        pass
+
+                node.create_subscription(Image, _CAMERA_TOPIC, image_cb, 5)
+            except Exception as cam_exc:
+                print(f'[osm_route_app] camera stream disabled: {cam_exc}')
+
+            # /cmd_vel publisher for manual teleop. Only publishes while teleop is
+            # engaged — leaving Nav2 in sole control of /cmd_vel otherwise.
+            _ros['cmd_pub'] = node.create_publisher(Twist, '/cmd_vel', 10)
+
+            def _teleop_tick():
+                t = _teleop
+                if not t['active']:
+                    return
+                now = time.monotonic()
+                lin, ang = t['lin'], t['ang']
+                # Deadman: a frozen tab / dropped network stops the robot.
+                if now - t['ts'] > _TELEOP_DEADMAN_S:
+                    lin = ang = 0.0
+                # Disengaging: send zeros briefly, then release /cmd_vel entirely.
+                if t['disengage_at'] and now >= t['disengage_at']:
+                    lin = ang = 0.0
+                    t['active'] = False
+                    t['disengage_at'] = 0.0
+                msg = Twist()
+                msg.linear.x = float(lin)
+                msg.angular.z = float(ang)
+                _ros['cmd_pub'].publish(msg)
+
+            node.create_timer(0.1, _teleop_tick)   # 10 Hz keep-alive / watchdog
             rclpy.spin(node)
         except Exception as exc:
             print(f'[osm_route_app] ROS monitor unavailable: {exc}')
@@ -72,7 +141,7 @@ def _refresh_nav_state():
         _nav_state = 'stopped'
 
 try:
-    from flask import Flask, request, jsonify
+    from flask import Flask, request, jsonify, Response
 except ImportError:
     print("ERROR: flask is not installed.  pip install flask")
     sys.exit(1)
@@ -277,6 +346,11 @@ def api_nav_stop():
             _nav_proc.terminate()
     _nav_proc = None
     _nav_state = 'stopped'
+    # Drop the target highlight if the follower was killed before clearing it
+    try:
+        os.remove(_NAV_TARGET_FILE)
+    except FileNotFoundError:
+        pass
     return jsonify({'state': 'stopped'})
 
 
@@ -286,9 +360,70 @@ def api_nav_status():
     return jsonify({'state': _nav_state})
 
 
+# ---------------------------------------------------------------------------
+# Manual teleop — over-control. Navigation must yield /cmd_vel first, so
+# engaging manual mode auto-pauses an active route.
+# ---------------------------------------------------------------------------
+@app.route('/api/teleop/engage', methods=['POST'])
+def api_teleop_engage():
+    global _nav_state
+    import time
+    if _ros['cmd_pub'] is None:
+        return jsonify({'error': 'cmd_vel publisher not ready (is ROS running?)'}), 503
+    _refresh_nav_state()
+    # Take over: pause the follower so Nav2 stops driving before we do.
+    if _nav_state == 'running':
+        _write_nav_cmd('pause')
+        _nav_state = 'paused'
+    _teleop.update(active=True, lin=0.0, ang=0.0,
+                   ts=time.monotonic(), disengage_at=0.0)
+    return jsonify({'state': 'manual', 'nav_state': _nav_state})
+
+
+@app.route('/api/teleop', methods=['POST'])
+def api_teleop_drive():
+    import time
+    if not _teleop['active']:
+        return jsonify({'error': 'Manual control not engaged'}), 409
+    body = request.json or {}
+    _teleop.update(lin=float(body.get('lin', 0.0)),
+                   ang=float(body.get('ang', 0.0)),
+                   ts=time.monotonic())
+    return jsonify({'ok': True})
+
+
+@app.route('/api/teleop/disengage', methods=['POST'])
+def api_teleop_disengage():
+    import time
+    # Coast to a stop (zeros) for a moment, then release /cmd_vel back to Nav2.
+    now = time.monotonic()
+    _teleop.update(lin=0.0, ang=0.0, ts=now, disengage_at=now + 0.4)
+    return jsonify({'state': 'idle'})
+
+
 @app.route('/api/robot_pose')
 def api_robot_pose():
     return jsonify(_robot_pose)
+
+
+@app.route('/api/camera')
+def api_camera():
+    """MJPEG stream of the robot camera for the monitoring screen."""
+    import time
+
+    def gen():
+        last_ts = 0.0
+        while True:
+            _camera['want_ts'] = time.monotonic()   # keep the encoder alive
+            frame, ts = _camera['jpeg'], _camera['ts']
+            if frame and ts != last_ts:
+                last_ts = ts
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                       + frame + b'\r\n')
+            time.sleep(0.04)
+
+    return Response(gen(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
 
 @app.route('/api/stop_status')
@@ -299,6 +434,19 @@ def api_stop_status():
         return jsonify({'waiting': bool(msg), 'message': msg})
     except FileNotFoundError:
         return jsonify({'waiting': False, 'message': ''})
+
+
+@app.route('/api/nav_target')
+def api_nav_target():
+    """Return the waypoint the follower is currently driving to, or active:False."""
+    try:
+        with open(_NAV_TARGET_FILE) as f:
+            data = yaml.safe_load(f) or {}
+        return jsonify({'active': True, **data})
+    except FileNotFoundError:
+        return jsonify({'active': False})
+    except Exception:
+        return jsonify({'active': False})
 
 
 @app.route('/api/stop_confirm', methods=['POST'])
@@ -394,6 +542,34 @@ body{font-family:system-ui,sans-serif;font-size:13px;display:flex;height:100vh;o
 .btn-orange{background:#e67e22;color:#fff}.btn-orange:hover:not(:disabled){background:#d35400}
 #nav-state-badge{display:inline-block;padding:3px 8px;border-radius:10px;font-size:10px;font-weight:700;letter-spacing:.4px;text-transform:uppercase}
 
+/* ── Target waypoint highlight ── */
+@keyframes target-pulse{0%{box-shadow:0 0 0 0 rgba(230,126,34,.7)}70%{box-shadow:0 0 0 12px rgba(230,126,34,0)}100%{box-shadow:0 0 0 0 rgba(230,126,34,0)}}
+.wp-target{width:20px;height:20px;border-radius:50%;background:#e67e22;border:3px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.4);animation:target-pulse 1.4s ease-out infinite}
+#nav-target-card{display:none;padding:7px 10px;background:#fef6ec;border:1.5px solid #e67e22;border-radius:6px;margin-bottom:4px}
+#nav-target-card .tc-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:#d35400;margin-bottom:3px}
+#nav-target-card .tc-body{font-size:11px;color:#555;font-family:monospace;line-height:1.7}
+#nav-target-card .tc-body b{color:#d35400;font-size:13px}
+
+/* ── Teleop pad ── */
+#teleop-card{border-top:1px solid #eee;margin-top:6px;padding-top:8px}
+#teleop-card .tp-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
+#teleop-card .tp-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#aaa}
+#btn-teleop{font-size:10px;padding:3px 8px;border-radius:10px;border:none;cursor:pointer;font-weight:700;background:#34495e;color:#fff}
+#btn-teleop.on{background:#16a085}
+#teleop-pad{display:none;margin-top:4px}
+#teleop-pad.show{display:block}
+.tp-grid{display:grid;grid-template-columns:repeat(3,1fr);grid-gap:5px;max-width:170px;margin:0 auto}
+.tp-grid button{padding:10px 0;font-size:16px;border:1px solid #ccc;border-radius:6px;background:#f7f9fb;cursor:pointer;user-select:none;touch-action:none}
+.tp-grid button:active{background:#16a085;color:#fff;border-color:#16a085}
+.tp-grid button.tp-stop{background:#c0392b;color:#fff;border-color:#c0392b;font-size:12px;font-weight:700}
+.tp-grid .tp-empty{visibility:hidden}
+.tp-speed{display:flex;align-items:center;gap:6px;margin:8px 2px 2px}
+.tp-speed label{font-size:10px;color:#888;width:34px}
+.tp-speed input{flex:1}
+.tp-speed .tp-val{font-size:10px;color:#16a085;font-family:monospace;width:54px;text-align:right}
+#teleop-pad .tp-hint{font-size:10px;color:#aaa;margin-top:6px;text-align:center}
+#teleop-locked{font-size:10px;color:#aaa;margin-top:4px;line-height:1.4}
+
 /* ── Status ── */
 #status{padding:6px 8px;border-radius:4px;font-size:11px;min-height:22px;line-height:1.4}
 .s-ok{background:#eafaf1;color:#1e8449}
@@ -413,6 +589,9 @@ body{font-family:system-ui,sans-serif;font-size:13px;display:flex;height:100vh;o
 
 /* ── Leaflet custom icons ── */
 .stop-icon{display:flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:50%;color:#fff;font-weight:800;font-size:11px;border:2px solid #fff;box-shadow:0 1px 5px rgba(0,0,0,.4)}
+.stop-icon.passed{opacity:.4;filter:grayscale(1)}
+.stop-icon.next{border-color:#e67e22;animation:stop-pulse 1.4s ease-out infinite}
+@keyframes stop-pulse{0%{box-shadow:0 0 0 0 rgba(230,126,34,.7)}70%{box-shadow:0 0 0 13px rgba(230,126,34,0)}100%{box-shadow:0 0 0 0 rgba(230,126,34,0)}}
 .wp-dot{width:10px;height:10px;border-radius:50%;background:#2980b9;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.35);cursor:grab;transition:transform .1s}
 .wp-dot:hover{transform:scale(1.5);background:#1a6090}
 
@@ -438,6 +617,30 @@ body{font-family:system-ui,sans-serif;font-size:13px;display:flex;height:100vh;o
 #legend{position:absolute;bottom:22px;right:10px;z-index:1000;background:rgba(255,255,255,.92);backdrop-filter:blur(4px);padding:10px 14px;border-radius:7px;border:1px solid #ddd;font-size:12px;line-height:2;box-shadow:0 2px 8px rgba(0,0,0,.1)}
 .leg{display:flex;align-items:center;gap:7px}
 .leg-line{width:22px;height:3px;border-radius:2px}
+
+/* ── Planning UI locked while navigating (observe only) ── */
+.locked{position:relative;pointer-events:none;opacity:.5;filter:grayscale(.7)}
+#planning-lock-note{display:none;padding:7px 10px;margin:0 12px 8px;background:#eef2f6;border:1px solid #d6dde4;border-radius:6px;font-size:11px;color:#667;line-height:1.4}
+#planning-lock-note.show{display:block}
+
+/* ── Monitoring screen (camera + telemetry) over the map ── */
+#monitor{display:none;position:absolute;inset:0;z-index:1200;background:#11151a;flex-direction:column}
+#monitor.show{display:flex}
+#monitor .cam-wrap{flex:1 1 auto;position:relative;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000}
+#monitor #cam-stream{max-width:100%;max-height:100%;object-fit:contain}
+#monitor .cam-off{position:absolute;color:#7a8694;font-size:13px;text-align:center;line-height:1.6}
+#mon-dest{position:absolute;top:14px;left:14px;right:14px;display:flex;align-items:center;gap:10px;background:rgba(20,24,30,.82);border:1px solid rgba(230,126,34,.55);border-radius:8px;padding:9px 13px;color:#fff;backdrop-filter:blur(4px)}
+#mon-dest .md-icon{font-size:18px}
+#mon-dest .md-text{font-size:14px;font-weight:600}
+#mon-dest .md-text b{color:#f0922b;font-size:18px}
+#mon-hud{display:flex;gap:0;background:#1a2027;border-top:1px solid #2a323c}
+#mon-hud .hud-cell{flex:1;padding:10px 12px;text-align:center;border-right:1px solid #2a323c}
+#mon-hud .hud-cell:last-child{border-right:none}
+#mon-hud .hud-label{font-size:10px;letter-spacing:.6px;text-transform:uppercase;color:#7a8694;margin-bottom:3px}
+#mon-hud .hud-val{font-size:17px;font-weight:700;color:#eaf0f6;font-family:monospace}
+#mon-hud .hud-val span{font-size:11px;color:#7a8694;font-weight:400}
+#mon-toggle{position:absolute;top:12px;right:12px;z-index:1300;background:rgba(20,24,30,.85);color:#fff;border:1px solid #3a434e;border-radius:6px;padding:6px 11px;font-size:12px;font-weight:600;cursor:pointer;display:none}
+#mon-toggle.show{display:block}
 </style>
 </head>
 <body>
@@ -464,6 +667,8 @@ body{font-family:system-ui,sans-serif;font-size:13px;display:flex;height:100vh;o
     <button class="tab" onclick="switchTab('draw')" id="tab-draw">Draw Path</button>
     <button class="tab" onclick="switchTab('edit')" id="tab-edit" disabled>Edit Waypoints</button>
   </div>
+
+  <div id="planning-lock-note">🔒 Navigating — route editing is locked. Stop navigation to edit again.</div>
 
   <div id="sidebar-body">
 
@@ -564,6 +769,43 @@ body{font-family:system-ui,sans-serif;font-size:13px;display:flex;height:100vh;o
         <button class="btn btn-red"    id="btn-nav-stop"  onclick="navStop()"  disabled>⏹ Stop</button>
       </div>
     </div>
+    <div id="nav-target-card">
+      <div class="tc-label">🎯 Heading to</div>
+      <div class="tc-body" id="nav-target-info">—</div>
+    </div>
+
+    <div id="teleop-card">
+      <div class="tp-head">
+        <span class="tp-title">🕹 Manual Control</span>
+        <button id="btn-teleop" onclick="toggleTeleop()">Take Over</button>
+      </div>
+      <div id="teleop-locked">Navigation has control. Take over to drive the robot manually — this pauses the route first.</div>
+      <div id="teleop-pad">
+        <div class="tp-grid">
+          <div class="tp-empty"></div>
+          <button data-dir="fwd"  title="Forward (W / ↑)">▲</button>
+          <div class="tp-empty"></div>
+          <button data-dir="left" title="Turn left (A / ←)">◀</button>
+          <button class="tp-stop" data-dir="stop" title="Stop (Space)">STOP</button>
+          <button data-dir="right" title="Turn right (D / →)">▶</button>
+          <div class="tp-empty"></div>
+          <button data-dir="back" title="Reverse (S / ↓)">▼</button>
+          <div class="tp-empty"></div>
+        </div>
+        <div class="tp-speed">
+          <label>Speed</label>
+          <input type="range" id="tp-lin" min="0.1" max="1.5" step="0.1" value="0.5">
+          <span class="tp-val" id="tp-lin-val">0.5 m/s</span>
+        </div>
+        <div class="tp-speed">
+          <label>Turn</label>
+          <input type="range" id="tp-ang" min="0.1" max="1.0" step="0.1" value="0.6">
+          <span class="tp-val" id="tp-ang-val">0.6 rad/s</span>
+        </div>
+        <div class="tp-hint">Hold a button or use W A S D / arrows · Space = stop</div>
+      </div>
+    </div>
+
     <div id="status"></div>
   </div>
 </div><!-- sidebar -->
@@ -572,7 +814,36 @@ body{font-family:system-ui,sans-serif;font-size:13px;display:flex;height:100vh;o
 <div id="map">
   <div id="legend">
     <div class="leg"><div class="leg-line" style="background:#2980b9"></div> Generated route</div>
+    <div class="leg"><div style="width:13px;height:13px;background:#e67e22;border:2px solid #fff;border-radius:50%;box-shadow:0 1px 3px rgba(0,0,0,.3)"></div> Current target</div>
     <div class="leg"><div style="width:11px;height:11px;background:#c0392b;border:2px solid #fff;border-radius:2px;transform:rotate(45deg);box-shadow:0 1px 3px rgba(0,0,0,.3)"></div> Stop point</div>
+  </div>
+
+  <button id="mon-toggle" onclick="toggleMonitorView()">🗺 Map view</button>
+
+  <!-- Live monitoring screen — shown while navigating -->
+  <div id="monitor">
+    <div id="mon-dest">
+      <span class="md-icon">🎯</span>
+      <span class="md-text" id="mon-dest-text">Waiting for destination…</span>
+    </div>
+    <div class="cam-wrap">
+      <div class="cam-off" id="cam-off">📷 Waiting for camera stream…<br><span style="font-size:11px">(topic /d455/image_raw)</span></div>
+      <img id="cam-stream" alt="" onload="document.getElementById('cam-off').style.display='none'"/>
+    </div>
+    <div id="mon-hud">
+      <div class="hud-cell">
+        <div class="hud-label">Linear speed</div>
+        <div class="hud-val" id="hud-lin">0.00 <span>m/s</span></div>
+      </div>
+      <div class="hud-cell">
+        <div class="hud-label">Turn rate</div>
+        <div class="hud-val" id="hud-ang">0.00 <span>rad/s</span></div>
+      </div>
+      <div class="hud-cell">
+        <div class="hud-label">Status</div>
+        <div class="hud-val" id="hud-state">—</div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -599,8 +870,13 @@ let drawDots  = [];
 let _robotMarker  = null;
 let _passedLine   = null;
 let _passedWpIdx  = 0;
+let _targetMarker = null;   // pulsing ring over the waypoint the robot is driving to
+let _targetWpIdx  = -1;     // its index into waypoints[] (-1 = no active target)
+let _navHighlighted = false; // true while nav markers are recoloured (so clear is idempotent)
 let _stopPts      = [];   // {index, latitude, longitude, marker}
 let _stopMode     = false;
+let _userWps      = [];   // user-defined numbered anchors mapped onto the dense route:
+                          // {num, lat, lon, wpIdx} — wpIdx = nearest dense waypoint index
 
 // ═══════════════════════════════════════════════════════════════════
 // Map
@@ -648,10 +924,11 @@ function stopColor(i) {
   return '#f39c12';
 }
 
-function makeStopIcon(i) {
+function makeStopIcon(i, state) {
+  const cls = state ? ' ' + state : '';   // '' | 'passed' | 'next'
   return L.divIcon({
     className: '',
-    html: `<div class="stop-icon" style="background:${stopColor(i)}">${i+1}</div>`,
+    html: `<div class="stop-icon${cls}" style="background:${stopColor(i)}">${i+1}</div>`,
     iconSize: [26,26], iconAnchor: [13,13]
   });
 }
@@ -690,7 +967,10 @@ function clearStops() {
   waypoints = [];
   if (routeLine)  { routeLine.remove();  routeLine  = null; }
   if (_passedLine){ _passedLine.remove(); _passedLine = null; }
+  if (_targetMarker){ _targetMarker.remove(); _targetMarker = null; }
   _passedWpIdx = 0;
+  _targetWpIdx = -1;
+  document.getElementById('nav-target-card').style.display = 'none';
   clearAllStops();
   document.getElementById('tab-edit').disabled = true;
   document.getElementById('wp-info').innerHTML = 'No waypoints yet.';
@@ -852,6 +1132,13 @@ function loadWaypoints(wps) {
   clearAllStops();
 
   waypoints = wps.map(wp => ({...wp, marker: null}));
+
+  // Map each user-defined numbered anchor (placed before generation) onto its
+  // nearest dense waypoint, so navigation progress can be reported against those
+  // few anchors instead of the hundreds of generated points.
+  _userWps = stops.map((s, i) => ({
+    num: i + 1, lat: s.lat, lon: s.lon, wpIdx: _nearestWpIndex(s.lat, s.lon)
+  })).sort((a, b) => a.wpIdx - b.wpIdx);
 
   // Polyline
   routeLine = L.polyline(waypoints.map(wp => [wp.latitude, wp.longitude]),
@@ -1089,41 +1376,147 @@ function updateRobotOnMap(lat, lon, headingRad) {
     _robotMarker.setLatLng([lat,lon]);
     _robotMarker.setIcon(icon);
   }
-
-  if (!waypoints.length) return;
-
-  // Find nearest waypoint to determine progress
-  let minDist = Infinity, nearestIdx = 0;
-  waypoints.forEach((wp, i) => {
-    const d = haversineM(lat, lon, wp.latitude, wp.longitude);
-    if (d < minDist) { minDist = d; nearestIdx = i; }
-  });
-  if (nearestIdx !== _passedWpIdx) refreshWpProgress(nearestIdx);
+  // Progress (which waypoint we are driving to) is driven by the follower via
+  // _applyNavTarget(), not by GPS-nearest guessing — the arrow only shows position.
 }
 
-function refreshWpProgress(currentIdx) {
-  _passedWpIdx = currentIdx;
+// ═══════════════════════════════════════════════════════════════════
+// Target waypoint highlight — authoritative, fed by route_waypoint_follower
+// ═══════════════════════════════════════════════════════════════════
 
-  // Trim route line: show only remaining waypoints
-  if (routeLine && waypoints.length > 0 && mode !== 'edit') {
-    const remaining = waypoints.slice(currentIdx).map(wp => [wp.latitude, wp.longitude]);
-    if (remaining.length >= 2) routeLine.setLatLngs(remaining);
+// Render the pulse ring + sidebar card + progress trail for the given waypoint.
+function _applyNavTarget(data) {
+  if (!data || !data.active || !waypoints.length) { _clearNavTarget(); return; }
+
+  // Authoritative index from the follower; fall back to nearest-by-coords if the
+  // app's waypoint list has drifted from the saved waypoints.yaml.
+  let idx = (typeof data.index === 'number') ? data.index : -1;
+  if ((idx < 0 || idx >= waypoints.length) && data.latitude != null && data.longitude != null) {
+    let md = Infinity;
+    waypoints.forEach((wp, i) => {
+      const d = haversineM(data.latitude, data.longitude, wp.latitude, wp.longitude);
+      if (d < md) { md = d; idx = i; }
+    });
+  }
+  if (idx < 0 || idx >= waypoints.length) { _clearNavTarget(); return; }
+
+  _targetWpIdx = idx;
+  _navHighlighted = true;
+
+  // Preferred view: track progress against the user-defined numbered anchors
+  // (the few points the user placed before generating the dense route).
+  if (_userWps.length) { _applyUserNavTarget(idx); return; }
+
+  // Fallback (e.g. free-draw routes with no numbered anchors): highlight the
+  // dense target waypoint directly.
+  const wp = waypoints[idx];
+  const ricon = L.divIcon({className:'', html:'<div class="wp-target"></div>',
+                           iconSize:[20,20], iconAnchor:[10,10]});
+  if (!_targetMarker) {
+    _targetMarker = L.marker([wp.latitude, wp.longitude],
+      {icon:ricon, zIndexOffset:1500, interactive:false}).addTo(map);
+  } else {
+    _targetMarker.setLatLng([wp.latitude, wp.longitude]);
+    _targetMarker.setIcon(ricon);
   }
 
-  // Faded dashed overlay for the traveled path
+  const seq   = (data.seq   != null) ? data.seq   : (idx + 1);
+  const total = (data.total != null) ? data.total : waypoints.length;
+  document.getElementById('nav-target-card').style.display = '';
+  document.getElementById('nav-target-info').innerHTML =
+    `Waypoint <b>${seq}</b> / ${total}`;
+  _setMonitorDest(seq, total);
+
+  _renderProgress(idx);
+}
+
+// Update the destination message on the monitoring screen.
+function _setMonitorDest(num, total) {
+  const el = document.getElementById('mon-dest-text');
+  if (el) el.innerHTML = `Heading to <b>Waypoint ${num}</b> of ${total}`;
+}
+
+// Highlight only the user-defined numbered anchors. The robot's current dense
+// target (idx) maps to "the next anchor at or beyond it" — that anchor pulses,
+// earlier anchors grey out, the rest stay normal.
+function _applyUserNavTarget(idx) {
+  let nd = _userWps.findIndex(u => u.wpIdx >= idx);
+  if (nd < 0) nd = _userWps.length - 1;   // past the last anchor → final destination
+  const dest = _userWps[nd];
+
+  // The pulsing numbered marker is the destination cue — no separate ring needed.
+  if (_targetMarker) { _targetMarker.remove(); _targetMarker = null; }
+
+  document.getElementById('nav-target-card').style.display = '';
+  document.getElementById('nav-target-info').innerHTML =
+    `Waypoint <b>${dest.num}</b> / ${_userWps.length}`;
+  _setMonitorDest(dest.num, _userWps.length);
+
+  // Colour the numbered markers: passed = grey, next = pulsing, upcoming = normal.
+  _userWps.forEach((u, j) => {
+    const s = stops[u.num - 1];
+    if (!s || !s.marker) return;
+    const state = j < nd ? 'passed' : (j === nd ? 'next' : '');
+    s.marker.setIcon(makeStopIcon(u.num - 1, state));
+  });
+
+  _renderPassedTrail(idx);
+}
+
+// Dashed grey trail along the dense route from the start up to the robot.
+function _renderPassedTrail(targetIdx) {
+  _passedWpIdx = targetIdx;
   if (_passedLine) { _passedLine.remove(); _passedLine = null; }
-  if (currentIdx > 0 && mode !== 'edit') {
-    const passed = waypoints.slice(0, currentIdx + 1).map(wp => [wp.latitude, wp.longitude]);
+  if (targetIdx > 0) {
+    const passed = waypoints.slice(0, targetIdx + 1).map(wp => [wp.latitude, wp.longitude]);
+    if (passed.length >= 2)
+      _passedLine = L.polyline(passed, {color:'#aaa', weight:3, opacity:.5, dashArray:'6 6'}).addTo(map);
+  }
+}
+
+function _clearNavTarget() {
+  _targetWpIdx = -1;
+  // Idempotent: only touch markers on the running→stopped transition. Resetting
+  // icons every poll would rebuild marker DOM and cancel an in-progress drag.
+  if (!_navHighlighted) return;
+  _navHighlighted = false;
+  if (_targetMarker) { _targetMarker.remove(); _targetMarker = null; }
+  const card = document.getElementById('nav-target-card');
+  if (card) card.style.display = 'none';
+  if (_passedLine) { _passedLine.remove(); _passedLine = null; }
+  _passedWpIdx = 0;
+  // restore default blue dots
+  waypoints.forEach(wp => { if (wp.marker) wp.marker.setIcon(makeWpIcon()); });
+  // restore numbered anchors to their normal look
+  stops.forEach((s, i) => { if (s.marker) s.marker.setIcon(makeStopIcon(i)); });
+}
+
+// Nearest dense-waypoint index to a lat/lon (used to anchor numbered points).
+function _nearestWpIndex(lat, lon) {
+  let best = 0, bd = Infinity;
+  waypoints.forEach((wp, i) => {
+    const d = haversineM(lat, lon, wp.latitude, wp.longitude);
+    if (d < bd) { bd = d; best = i; }
+  });
+  return best;
+}
+
+// Dashed trail for passed waypoints + recolour: passed=grey, target=orange, upcoming=blue
+function _renderProgress(targetIdx) {
+  _passedWpIdx = targetIdx;
+
+  if (_passedLine) { _passedLine.remove(); _passedLine = null; }
+  if (targetIdx > 0 && mode !== 'edit') {
+    const passed = waypoints.slice(0, targetIdx + 1).map(wp => [wp.latitude, wp.longitude]);
     if (passed.length >= 2)
       _passedLine = L.polyline(passed, {color:'#aaa', weight:2, opacity:.45, dashArray:'5 5'}).addTo(map);
   }
 
-  // Re-colour waypoint markers
   waypoints.forEach((wp, i) => {
     if (!wp.marker) return;
     let bg, border, sz, anchor;
-    if (i < currentIdx)       { bg='#aaa';    border='#ccc'; sz=7;  anchor=3.5; }
-    else if (i === currentIdx){ bg='#e67e22'; border='#fff'; sz=14; anchor=7;   }
+    if (i < targetIdx)        { bg='#aaa';    border='#ccc'; sz=7;  anchor=3.5; }
+    else if (i === targetIdx) { bg='#e67e22'; border='#fff'; sz=12; anchor=6;   }
     else                      { bg='#2980b9'; border='#fff'; sz=10; anchor=5;   }
     wp.marker.setIcon(L.divIcon({
       className:'',
@@ -1140,8 +1533,21 @@ setInterval(async () => {
     const r = await fetch('/api/robot_pose');
     const d = await r.json();
     if (d.available) updateRobotOnMap(d.lat, d.lon, d.heading);
+    if (typeof d.lin === 'number') {
+      document.getElementById('hud-lin').innerHTML = d.lin.toFixed(2) + ' <span>m/s</span>';
+      document.getElementById('hud-ang').innerHTML = d.ang.toFixed(2) + ' <span>rad/s</span>';
+    }
   } catch {}
 }, 500);
+
+// Poll the follower's current target every 700 ms
+setInterval(async () => {
+  try {
+    const r = await fetch('/api/nav_target');
+    const d = await r.json();
+    _applyNavTarget(d);
+  } catch {}
+}, 700);
 
 // ═══════════════════════════════════════════════════════════════════
 // Stop points
@@ -1316,9 +1722,59 @@ function _applyNavState(state) {
   badge.textContent        = cfg.label;
   badge.style.background   = cfg.bg;
   badge.style.color        = cfg.color;
+
+  // Lock the planning UI + show the monitoring screen while navigating.
+  const active = (state === 'running' || state === 'paused');
+  if (active !== _navActive) {
+    _navActive = active;
+    _setPlanningLocked(active);
+    showMonitor(active);
+  }
+  const hudState = document.getElementById('hud-state');
+  if (hudState) hudState.textContent = cfg.label;
+}
+
+// ── Navigating mode: lock planning, show camera/telemetry screen ──
+let _navActive   = false;
+let _monitorView = false;   // true = camera screen up, false = map
+
+function _setMarkersDraggable(on) {
+  const apply = m => { if (m && m.dragging) { on ? m.dragging.enable() : m.dragging.disable(); } };
+  waypoints.forEach(wp => apply(wp.marker));
+  stops.forEach(s => apply(s.marker));
+  _stopPts.forEach(sp => apply(sp.marker));
+}
+
+function _setPlanningLocked(locked) {
+  document.getElementById('tabs').classList.toggle('locked', locked);
+  document.getElementById('sidebar-body').classList.toggle('locked', locked);
+  document.getElementById('planning-lock-note').classList.toggle('show', locked);
+  _setMarkersDraggable(!locked);
+}
+
+function _setMonitorView(on) {
+  _monitorView = on;
+  const cam = document.getElementById('cam-stream');
+  document.getElementById('monitor').classList.toggle('show', on);
+  document.getElementById('mon-toggle').textContent = on ? '🗺 Map view' : '📹 Camera view';
+  if (on) {
+    if (!cam.getAttribute('src')) cam.src = '/api/camera?t=' + Date.now();
+  } else {
+    cam.removeAttribute('src');   // close the MJPEG connection
+    document.getElementById('cam-off').style.display = '';
+  }
+}
+
+function toggleMonitorView() { _setMonitorView(!_monitorView); }
+
+function showMonitor(active) {
+  document.getElementById('mon-toggle').classList.toggle('show', active);
+  _setMonitorView(active);
+  if (!active) document.getElementById('mon-dest-text').textContent = 'Waiting for destination…';
 }
 
 async function navStart() {
+  if (_teleopOn) await teleopOff();   // hand /cmd_vel back to Nav2 before it drives
   await saveStopsConfig();   // persist latest stop config before launching follower
   try {
     const r = await fetch('/api/nav/start', {method:'POST'});
@@ -1356,6 +1812,115 @@ setInterval(async () => {
     if (d.state !== _navState) _applyNavState(d.state);
   } catch {}
 }, 2000);
+
+// ═══════════════════════════════════════════════════════════════════
+// Manual teleop — over-control when nav is paused/stopped
+// ═══════════════════════════════════════════════════════════════════
+let _teleopOn    = false;
+let _teleopHeld  = null;   // direction currently held, or null
+let _teleopTimer = null;   // keep-alive interval that feeds the deadman
+
+const _TP_KEYS = {
+  'w':'fwd', 'arrowup':'fwd',  's':'back',  'arrowdown':'back',
+  'a':'left','arrowleft':'left','d':'right','arrowright':'right', ' ':'stop',
+};
+
+function _tpVel(dir) {
+  const lin = parseFloat(document.getElementById('tp-lin').value);
+  const ang = parseFloat(document.getElementById('tp-ang').value);
+  switch (dir) {
+    case 'fwd':   return {lin:  lin, ang:   0};
+    case 'back':  return {lin: -lin, ang:   0};
+    case 'left':  return {lin:    0, ang:  ang};
+    case 'right': return {lin:    0, ang: -ang};
+    default:      return {lin:    0, ang:   0};
+  }
+}
+
+async function _tpSend(lin, ang) {
+  try {
+    await fetch('/api/teleop', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({lin, ang})});
+  } catch {}
+}
+
+function teleopHold(dir) {
+  if (!_teleopOn || dir === 'stop') { if (dir === 'stop') teleopRelease(); return; }
+  if (_teleopHeld === dir) return;   // ignore key auto-repeat
+  _teleopHeld = dir;
+  const send = () => { const v = _tpVel(_teleopHeld); _tpSend(v.lin, v.ang); };
+  send();
+  if (_teleopTimer) clearInterval(_teleopTimer);
+  _teleopTimer = setInterval(send, 150);   // < deadman window, keeps robot moving
+}
+
+function teleopRelease() {
+  _teleopHeld = null;
+  if (_teleopTimer) { clearInterval(_teleopTimer); _teleopTimer = null; }
+  if (_teleopOn) _tpSend(0, 0);
+}
+
+async function teleopOn() {
+  try {
+    const r = await fetch('/api/teleop/engage', {method:'POST'});
+    const d = await r.json();
+    if (!r.ok) { status('✗ ' + (d.error || 'Cannot take over'), 'err'); return; }
+    _teleopOn = true;
+    if (d.nav_state) _applyNavState(d.nav_state);
+    const btn = document.getElementById('btn-teleop');
+    btn.textContent = 'Release'; btn.classList.add('on');
+    document.getElementById('teleop-pad').classList.add('show');
+    document.getElementById('teleop-locked').style.display = 'none';
+    status('🕹 Manual control — navigation paused', 'info');
+  } catch(e) { status('✗ ' + e.message, 'err'); }
+}
+
+async function teleopOff() {
+  teleopRelease();
+  _teleopOn = false;
+  try { await fetch('/api/teleop/disengage', {method:'POST'}); } catch {}
+  const btn = document.getElementById('btn-teleop');
+  btn.textContent = 'Take Over'; btn.classList.remove('on');
+  document.getElementById('teleop-pad').classList.remove('show');
+  document.getElementById('teleop-locked').style.display = '';
+  status('Manual control released', 'info');
+}
+
+function toggleTeleop() { _teleopOn ? teleopOff() : teleopOn(); }
+
+// Wire pad buttons (mouse + touch via pointer events)
+document.querySelectorAll('#teleop-pad .tp-grid button').forEach(btn => {
+  const dir = btn.dataset.dir;
+  btn.addEventListener('pointerdown',   e => { e.preventDefault(); teleopHold(dir); });
+  btn.addEventListener('pointerup',     teleopRelease);
+  btn.addEventListener('pointerleave',  teleopRelease);
+  btn.addEventListener('pointercancel', teleopRelease);
+});
+
+// Speed slider labels
+document.getElementById('tp-lin').addEventListener('input', e => {
+  document.getElementById('tp-lin-val').textContent = (+e.target.value).toFixed(1) + ' m/s';
+});
+document.getElementById('tp-ang').addEventListener('input', e => {
+  document.getElementById('tp-ang-val').textContent = (+e.target.value).toFixed(1) + ' rad/s';
+});
+
+// Keyboard driving (only while manual control is engaged)
+window.addEventListener('keydown', e => {
+  if (!_teleopOn) return;
+  const tag = (e.target.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea') return;
+  const dir = _TP_KEYS[e.key.toLowerCase()];
+  if (!dir) return;
+  e.preventDefault();
+  if (dir === 'stop') teleopRelease(); else teleopHold(dir);
+});
+window.addEventListener('keyup', e => {
+  if (!_teleopOn) return;
+  const dir = _TP_KEYS[e.key.toLowerCase()];
+  if (dir && dir !== 'stop') teleopRelease();
+});
 
 // ═══════════════════════════════════════════════════════════════════
 // Stop confirmation popup (Leaflet popup on the stop marker)
@@ -1473,7 +2038,8 @@ def main():
     print("  Press Ctrl+C to stop.")
     print()
 
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False,
+            threaded=True)   # threaded: the camera MJPEG stream holds a worker
 
 
 if __name__ == '__main__':

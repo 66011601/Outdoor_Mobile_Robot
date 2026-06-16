@@ -32,20 +32,20 @@ COLOR_RMSE      = '#c0392b'     # RMSE horizontal line
 COLOR_START     = '#2c3e50'     # start-point dot (both plots)
 COLOR_GRID      = '#cccccc'     # grid line colour
 
-LW_GT           = 2.5           # linewidth — ground truth
-LW_EST          = 2.0           # linewidth — estimate
+LW_GT           = 1.5           # linewidth — ground truth
+LW_EST          = 1.25           # linewidth — estimate
 LW_ERROR        = 1.5           # linewidth — error curve
 LW_STAT         = 1.5           # linewidth — mean / RMSE reference lines
 
 ERROR_YMIN      = 0.0           # error plot Y-axis lower bound (m)
-ERROR_YMAX      = 10.0          # error plot Y-axis upper bound (m) — keep fixed for comparability
+ERROR_YMAX      = 100.0          # error plot Y-axis upper bound (m) — keep fixed for comparability
 GRID_ALPHA      = 0.35          # grid line transparency  (0 = invisible, 1 = solid)
 
 FONT_SUPTITLE   = 14            # figure-level title font size
 FONT_AX_TITLE   = 12            # axes subtitle font size
 
 TOPIC_GT        = '/ground_truth/odom'  # Gazebo ground-truth odometry
-TOPIC_EST       = '/odometry/global'     # robot_localization EKF output
+TOPIC_EST       = '/odometry/local'     # robot_localization EKF output
 
 OUTPUT_DIR      = '/home/thana/VIO_Compare'                # directory for saved files
 
@@ -69,7 +69,9 @@ class OdomAccuracyPlot(Node):
         super().__init__('odom_accuracy_plot')
 
         self.declare_parameter('label', 'estimate')
+        self.declare_parameter('output_dir', OUTPUT_DIR)
         self._label = str(self.get_parameter('label').value)
+        self._output_dir = str(self.get_parameter('output_dir').value)
 
         # Raw storage — collected at each topic's own rate
         self._gt:  list[tuple[float, float, float]] = []   # (t, x, y)
@@ -170,7 +172,7 @@ class OdomAccuracyPlot(Node):
 
         ax.plot(gt_x, gt_y,
                 color=COLOR_GT, linewidth=LW_GT,
-                label='Ground truth', zorder=3)
+                alpha=0.5, label='Ground truth', zorder=3)
         ax.plot(est_x, est_y,
                 color=COLOR_EST, linewidth=LW_EST, linestyle='--',
                 label=f'/odometry/local  ({self._label})', zorder=2)
@@ -185,7 +187,7 @@ class OdomAccuracyPlot(Node):
         ax.set_aspect('equal')
         plt.tight_layout()
 
-        path = f'{OUTPUT_DIR}/odom_route_{self._label}_{stamp}.png'
+        path = f'{self._output_dir}/odom_route_{self._label}_{stamp}.png'
         fig.savefig(path, dpi=FIGURE_DPI, bbox_inches='tight')
         plt.close(fig)
         self.get_logger().info(f"Route plot → {path}")
@@ -216,7 +218,7 @@ class OdomAccuracyPlot(Node):
         ax.grid(True, color=COLOR_GRID, alpha=GRID_ALPHA)
         plt.tight_layout()
 
-        path = f'{OUTPUT_DIR}/odom_error_{self._label}_{stamp}.png'
+        path = f'{self._output_dir}/odom_error_{self._label}_{stamp}.png'
         fig.savefig(path, dpi=FIGURE_DPI, bbox_inches='tight')
         plt.close(fig)
         self.get_logger().info(f"Error plot → {path}")
@@ -224,7 +226,7 @@ class OdomAccuracyPlot(Node):
     # ── CSV ──────────────────────────────────────────────────────────────────
 
     def _save_csv(self, ts_est, gt_xi, gt_yi, est_x, est_y, errors, stamp):
-        path = f'{OUTPUT_DIR}/odom_accuracy_{self._label}_{stamp}.csv'
+        path = f'{self._output_dir}/odom_accuracy_{self._label}_{stamp}.csv'
         with open(path, 'w') as f:
             f.write('time,gt_x,gt_y,est_x,est_y,error\n')
             for i in range(len(ts_est)):

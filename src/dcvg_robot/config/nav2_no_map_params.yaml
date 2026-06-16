@@ -87,9 +87,14 @@ controller_server:
       plugin: "nav2_controller::SimpleProgressChecker"
       required_movement_radius: 0.5
       # After this many seconds without 0.5m progress, declare stuck →
-      # BT triggers recovery → if all recoveries fail, waypoint is skipped
-      # (stop_on_failure: false in waypoint_follower keeps the mission going)
-      movement_time_allowance: 15.0
+      # BT triggers recovery (custom BT backs up before spinning) → if all
+      # recoveries fail, waypoint is skipped (stop_on_failure: false in
+      # waypoint_follower keeps the mission going).
+      # Reduced from 15.0: don't grind against a depth-camera-only obstacle for
+      # 15s. At cruising speed the robot still makes 0.5m easily; this only
+      # fires when genuinely stuck, so recovery kicks in fast without lowering
+      # the global max velocity.
+      movement_time_allowance: 8.0
     # Goal checker parameters
     #precise_goal_checker:
     #  plugin: "nav2_controller::SimpleGoalChecker"
@@ -121,9 +126,9 @@ controller_server:
       min_speed_xy: 0.0
       max_speed_xy: 1.5
       min_speed_theta: 0.0
-      acc_lim_x: 2.5
+      acc_lim_x: 1.5
       acc_lim_y: 0.0
-      acc_lim_theta: 3.2
+      acc_lim_theta: 2.2
       decel_lim_x: -2.5
       decel_lim_y: 0.0
       decel_lim_theta: -3.2
@@ -162,10 +167,10 @@ local_costmap:
       global_frame: odom
       robot_base_frame: base_link
       rolling_window: true
-      width: 7
-      height: 7
+      width: 10
+      height: 10
       resolution: 0.05
-      robot_radius: 1.00
+      robot_radius: 0.85
       plugins: ["stvl_layer", "denoise_layer", "inflation_layer"]
       stvl_layer:
         plugin: "spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer"
@@ -176,7 +181,7 @@ local_costmap:
         # Increased from 3.0: exponential decay at 3s fades obstacles in ~9s.
         # A slow robot can take longer than that to clear an obstacle, making
         # it disappear as "free" before the robot has actually passed.
-        voxel_decay: 2.0
+        voxel_decay: 8.0
         decay_model: 0             # 0=linear — predictable, easier to reason about
         voxel_size: 0.05           # matches costmap resolution
         track_unknown_space: true
@@ -190,23 +195,23 @@ local_costmap:
         max_obstacle_height: 2.0
         min_obstacle_height: 0.0
         observation_sources: scan depth_obstacles
-        scan:
-          data_type: LaserScan
-          topic: /lidar/scan
-          marking: true
-          clearing: true
-          obstacle_range: 6.0
-          raytrace_range: 7.0
-          min_obstacle_height: 0.0
-          max_obstacle_height: 2.0
-          inf_is_valid: false
+        # scan:
+        #   data_type: LaserScan
+        #   topic: /lidar/scan
+        #   marking: true
+        #   clearing: true
+        #   obstacle_range: 6.0
+        #   raytrace_range: 7.0
+        #   min_obstacle_height: 0.0
+        #   max_obstacle_height: 2.0
+        #   inf_is_valid: false
         depth_obstacles:
           data_type: PointCloud2
           topic: /camera/depth/obstacles
           marking: true
           clearing: true
-          obstacle_range: 3.0
-          raytrace_range: 4.0
+          obstacle_range: 7.0
+          raytrace_range: 8.0
           min_obstacle_height: 0.1
           max_obstacle_height: 2.0
           voxel_filter: true
@@ -218,7 +223,7 @@ local_costmap:
         group_connectivity_type: 8 # 8-connected: diagonals count as same cluster
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
+        cost_scaling_factor: 1.0
         inflation_radius: 1.5
       always_send_full_costmap: True
 
@@ -251,18 +256,18 @@ global_costmap:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
         observation_sources: scan depth_obstacles
-        scan:
-          topic: /lidar/scan
-          max_obstacle_height: 2.0
-          clearing: True
-          marking: True
-          data_type: "LaserScan"
-          raytrace_max_range: 9.0
-          raytrace_min_range: 0.0
-          obstacle_max_range: 7.0
-          obstacle_min_range: 0.0
-          # outdoors there will probably be more inf points
-          inf_is_valid: false
+        # scan:
+        #   topic: /lidar/scan
+        #   max_obstacle_height: 2.0
+        #   clearing: True
+        #   marking: True
+        #   data_type: "LaserScan"
+        #   raytrace_max_range: 9.0
+        #   raytrace_min_range: 0.0
+        #   obstacle_max_range: 7.0
+        #   obstacle_min_range: 0.0
+        #   # outdoors there will probably be more inf points
+        #   inf_is_valid: false
         depth_obstacles:
           topic: /camera/depth/obstacles
           min_obstacle_height: 0.1
