@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import yaml
 
@@ -38,6 +39,17 @@ _camera = {'jpeg': None, 'ts': 0.0, 'want_ts': 0.0}
 _TELEOP_DEADMAN_S = 0.5     # stop the robot if no fresh command within this window
 _teleop = {'active': False, 'lin': 0.0, 'ang': 0.0, 'ts': 0.0, 'disengage_at': 0.0}
 _ros = {'cmd_pub': None}    # filled in once the ROS monitor node is up
+
+# ---------------------------------------------------------------------------
+# Stall watchdog — auto-pause + alert if the robot stops moving mid-route
+# (stuck / blocked) while it is supposed to be navigating.
+# ---------------------------------------------------------------------------
+_STALL_LIN       = 0.03     # m/s   below this (and below _STALL_ANG) = "not moving"
+_STALL_ANG       = 0.05     # rad/s (spins/recoveries exceed this, so they don't trip it)
+_STALL_TIMEOUT_S = 7.0      # motionless this long while navigating → auto-pause
+_STALL_GRACE_S   = 6.0      # ignore stalls right after a (re)start while Nav2 plans
+_stall = {'since': None, 'notified': False, 'grace_until': 0.0}
+_nav_alert = {'active': False, 'message': ''}
 
 
 def _start_ros_monitor():
@@ -119,6 +131,45 @@ def _start_ros_monitor():
                 _ros['cmd_pub'].publish(msg)
 
             node.create_timer(0.1, _teleop_tick)   # 10 Hz keep-alive / watchdog
+
+            def _stall_tick():
+                global _nav_state
+                st = _stall
+                if _nav_state != 'running':
+                    st['since'] = None
+                    st['notified'] = False
+                    return
+                now = time.monotonic()
+                if now < st['grace_until']:
+                    st['since'] = None          # Nav2 still spinning up after start
+                    return
+                # Don't flag a deliberate wait at a stop point.
+                try:
+                    with open(_STOP_STATUS_FILE) as f:
+                        if f.read().strip():
+                            st['since'] = None
+                            return
+                except FileNotFoundError:
+                    pass
+                moving = (abs(_robot_pose.get('lin', 0.0)) > _STALL_LIN or
+                          abs(_robot_pose.get('ang', 0.0)) > _STALL_ANG)
+                if moving:
+                    st['since'] = None
+                    return
+                if st['since'] is None:
+                    st['since'] = now
+                elif (now - st['since'] > _STALL_TIMEOUT_S) and not st['notified']:
+                    _write_nav_cmd('pause')     # stop the robot in place
+                    _nav_state = 'paused'
+                    _nav_alert['active'] = True
+                    _nav_alert['message'] = (
+                        f"Robot hasn't moved for {int(_STALL_TIMEOUT_S)}s — it may be "
+                        "stuck or blocked. Navigation auto-paused. Take manual control "
+                        "or resume when clear.")
+                    st['notified'] = True
+                    print('[osm_route_app] STALL detected → auto-paused navigation')
+
+            node.create_timer(0.5, _stall_tick)    # 2 Hz stall watchdog
             rclpy.spin(node)
         except Exception as exc:
             print(f'[osm_route_app] ROS monitor unavailable: {exc}')
@@ -132,6 +183,19 @@ _start_ros_monitor()
 def _write_nav_cmd(cmd):
     with open(_NAV_CMD_FILE, 'w') as f:
         f.write(cmd)
+
+
+def _clear_nav_alert():
+    _nav_alert['active'] = False
+    _nav_alert['message'] = ''
+
+
+def _arm_stall_watchdog():
+    """Reset the stall detector and grant a grace window (used on (re)start)."""
+    _stall['since'] = None
+    _stall['notified'] = False
+    _stall['grace_until'] = time.monotonic() + _STALL_GRACE_S
+    _clear_nav_alert()
 
 
 def _refresh_nav_state():
@@ -311,6 +375,7 @@ def api_nav_start():
     if _nav_state == 'paused':
         _write_nav_cmd('run')
         _nav_state = 'running'
+        _arm_stall_watchdog()
         return jsonify({'state': 'running'})
     if _nav_proc and _nav_proc.poll() is None:
         _write_nav_cmd('stop')
@@ -321,6 +386,7 @@ def api_nav_start():
     _write_nav_cmd('run')
     _nav_proc = subprocess.Popen(['ros2', 'run', 'dcvg_robot', 'route_waypoint_follower'])
     _nav_state = 'running'
+    _arm_stall_watchdog()
     return jsonify({'state': 'running'})
 
 
@@ -332,6 +398,7 @@ def api_nav_pause():
         return jsonify({'error': 'Not running'}), 400
     _write_nav_cmd('pause')
     _nav_state = 'paused'
+    _clear_nav_alert()
     return jsonify({'state': 'paused'})
 
 
@@ -346,6 +413,7 @@ def api_nav_stop():
             _nav_proc.terminate()
     _nav_proc = None
     _nav_state = 'stopped'
+    _clear_nav_alert()
     # Drop the target highlight if the follower was killed before clearing it
     try:
         os.remove(_NAV_TARGET_FILE)
@@ -357,7 +425,13 @@ def api_nav_stop():
 @app.route('/api/nav/status')
 def api_nav_status():
     _refresh_nav_state()
-    return jsonify({'state': _nav_state})
+    return jsonify({'state': _nav_state, 'alert': dict(_nav_alert)})
+
+
+@app.route('/api/nav/ack_alert', methods=['POST'])
+def api_nav_ack_alert():
+    _clear_nav_alert()
+    return jsonify({'status': 'ok'})
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +449,7 @@ def api_teleop_engage():
     if _nav_state == 'running':
         _write_nav_cmd('pause')
         _nav_state = 'paused'
+    _clear_nav_alert()   # taking manual control acknowledges any stall alert
     _teleop.update(active=True, lin=0.0, ang=0.0,
                    ts=time.monotonic(), disengage_at=0.0)
     return jsonify({'state': 'manual', 'nav_state': _nav_state})
@@ -641,9 +716,34 @@ body{font-family:system-ui,sans-serif;font-size:13px;display:flex;height:100vh;o
 #mon-hud .hud-val span{font-size:11px;color:#7a8694;font-weight:400}
 #mon-toggle{position:absolute;top:12px;right:12px;z-index:1300;background:rgba(20,24,30,.85);color:#fff;border:1px solid #3a434e;border-radius:6px;padding:6px 11px;font-size:12px;font-weight:600;cursor:pointer;display:none}
 #mon-toggle.show{display:block}
+
+/* ── Stall alert banner (robot stuck / not moving) ── */
+#nav-alert{display:none;position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:3000;max-width:540px;width:calc(100% - 40px);background:#fff;border:2px solid #c0392b;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.3);overflow:hidden;animation:alert-in .25s ease-out}
+#nav-alert.show{display:block}
+@keyframes alert-in{from{opacity:0;transform:translate(-50%,-12px)}to{opacity:1;transform:translate(-50%,0)}}
+#nav-alert .na-head{display:flex;align-items:center;gap:9px;background:#c0392b;color:#fff;padding:9px 14px;font-weight:700;font-size:14px}
+#nav-alert .na-head .na-pulse{width:11px;height:11px;border-radius:50%;background:#fff;animation:alert-blink 1s ease-in-out infinite}
+@keyframes alert-blink{0%,100%{opacity:1}50%{opacity:.25}}
+#nav-alert .na-body{padding:12px 14px;font-size:13px;color:#444;line-height:1.5}
+#nav-alert .na-actions{display:flex;gap:8px;padding:0 14px 13px}
+#nav-alert .na-actions button{flex:1;padding:9px 0;border:none;border-radius:6px;font-size:12.5px;font-weight:700;cursor:pointer}
+#nav-alert .na-take{background:#16a085;color:#fff}
+#nav-alert .na-resume{background:#27ae60;color:#fff}
+#nav-alert .na-dismiss{background:#ecf0f1;color:#666;flex:0 0 auto;padding:9px 14px}
 </style>
 </head>
 <body>
+
+<!-- ── Stall alert (robot not moving / stuck) ── -->
+<div id="nav-alert">
+  <div class="na-head"><span class="na-pulse"></span> Robot may be stuck</div>
+  <div class="na-body" id="nav-alert-msg"></div>
+  <div class="na-actions">
+    <button class="na-take"    onclick="alertTakeControl()">🕹 Take manual control</button>
+    <button class="na-resume"  onclick="alertResume()">▶ Resume</button>
+    <button class="na-dismiss" onclick="alertDismiss()">Dismiss</button>
+  </div>
+</div>
 
 <!-- ── Sidebar ── -->
 <div id="sidebar">
@@ -840,8 +940,8 @@ body{font-family:system-ui,sans-serif;font-size:13px;display:flex;height:100vh;o
         <div class="hud-val" id="hud-ang">0.00 <span>rad/s</span></div>
       </div>
       <div class="hud-cell">
-        <div class="hud-label">Status</div>
-        <div class="hud-val" id="hud-state">—</div>
+        <div class="hud-label">Destination</div>
+        <div class="hud-val" id="hud-dest">—</div>
       </div>
     </div>
   </div>
@@ -1430,10 +1530,12 @@ function _applyNavTarget(data) {
   _renderProgress(idx);
 }
 
-// Update the destination message on the monitoring screen.
+// Update the destination message + HUD cell on the monitoring screen.
 function _setMonitorDest(num, total) {
   const el = document.getElementById('mon-dest-text');
   if (el) el.innerHTML = `Heading to <b>Waypoint ${num}</b> of ${total}`;
+  const hud = document.getElementById('hud-dest');
+  if (hud) hud.innerHTML = `WP ${num} <span>/ ${total}</span>`;
 }
 
 // Highlight only the user-defined numbered anchors. The robot's current dense
@@ -1730,8 +1832,6 @@ function _applyNavState(state) {
     _setPlanningLocked(active);
     showMonitor(active);
   }
-  const hudState = document.getElementById('hud-state');
-  if (hudState) hudState.textContent = cfg.label;
 }
 
 // ── Navigating mode: lock planning, show camera/telemetry screen ──
@@ -1770,7 +1870,10 @@ function toggleMonitorView() { _setMonitorView(!_monitorView); }
 function showMonitor(active) {
   document.getElementById('mon-toggle').classList.toggle('show', active);
   _setMonitorView(active);
-  if (!active) document.getElementById('mon-dest-text').textContent = 'Waiting for destination…';
+  if (!active) {
+    document.getElementById('mon-dest-text').textContent = 'Waiting for destination…';
+    document.getElementById('hud-dest').textContent = '—';
+  }
 }
 
 async function navStart() {
@@ -1804,14 +1907,51 @@ async function navStop() {
   } catch(e) { status('✗ ' + e.message, 'err'); }
 }
 
-// Poll nav status every 2 s to catch process finishing naturally
+// Poll nav status every 1.5 s to catch process finishing + stall alerts
 setInterval(async () => {
   try {
     const r = await fetch('/api/nav/status');
     const d = await r.json();
     if (d.state !== _navState) _applyNavState(d.state);
+    _applyNavAlert(d.alert);
   } catch {}
-}, 2000);
+}, 1500);
+
+// ── Stall alert (server auto-paused because the robot stopped moving) ──
+let _shownAlertMsg = null;
+
+function _applyNavAlert(alert) {
+  const banner = document.getElementById('nav-alert');
+  if (alert && alert.active) {
+    if (_shownAlertMsg === alert.message) return;   // already showing this one
+    _shownAlertMsg = alert.message;
+    document.getElementById('nav-alert-msg').textContent = alert.message;
+    banner.classList.add('show');
+  } else {
+    _shownAlertMsg = null;
+    banner.classList.remove('show');
+  }
+}
+
+function _hideAlert() {
+  _shownAlertMsg = null;
+  document.getElementById('nav-alert').classList.remove('show');
+}
+
+async function alertResume() {
+  _hideAlert();
+  await navStart();                 // resumes (clears the alert server-side too)
+}
+
+async function alertTakeControl() {
+  _hideAlert();
+  await teleopOn();                 // engage manual driving (also clears the alert)
+}
+
+async function alertDismiss() {
+  _hideAlert();
+  try { await fetch('/api/nav/ack_alert', {method:'POST'}); } catch {}
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // Manual teleop — over-control when nav is paused/stopped

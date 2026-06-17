@@ -120,11 +120,11 @@ controller_server:
       # Reduced from 5.2: at 5.2 m/s the 8.84m simulated trajectory extends
       # beyond the 7m (3.5m radius) costmap — obstacles ahead are invisible.
       # At 1.5 m/s: sim_time 1.7s × 1.5 = 2.55m trajectory → fits comfortably.
-      max_vel_x: 1.5
+      max_vel_x: 1.25
       max_vel_y: 0.0
       max_vel_theta: 1.0
       min_speed_xy: 0.0
-      max_speed_xy: 1.5
+      max_speed_xy: 1.25
       min_speed_theta: 0.0
       acc_lim_x: 1.5
       acc_lim_y: 0.0
@@ -170,7 +170,7 @@ local_costmap:
       width: 10
       height: 10
       resolution: 0.05
-      robot_radius: 0.85
+      robot_radius: 0.95
       plugins: ["stvl_layer", "denoise_layer", "inflation_layer"]
       stvl_layer:
         plugin: "spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer"
@@ -181,7 +181,7 @@ local_costmap:
         # Increased from 3.0: exponential decay at 3s fades obstacles in ~9s.
         # A slow robot can take longer than that to clear an obstacle, making
         # it disappear as "free" before the robot has actually passed.
-        voxel_decay: 8.0
+        voxel_decay: 10.0
         decay_model: 0             # 0=linear — predictable, easier to reason about
         voxel_size: 0.05           # matches costmap resolution
         track_unknown_space: true
