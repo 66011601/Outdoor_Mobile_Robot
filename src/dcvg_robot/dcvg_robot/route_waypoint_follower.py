@@ -32,7 +32,7 @@ from rclpy.node import Node
 from robot_localization.srv import FromLL
 from std_msgs.msg import String
 
-from nav2_gps_waypoint_follower_demo.utils.gps_utils import quaternion_from_euler
+from geometry_msgs.msg import Quaternion
 
 _NAV_CMD_FILE      = '/tmp/dcvg_nav_cmd'
 _STOP_STATUS_FILE  = '/tmp/dcvg_stop_status'
@@ -88,6 +88,24 @@ def _check_file_confirm() -> bool:
     except FileNotFoundError:
         pass
     return False
+
+def quaternion_from_euler(roll, pitch, yaw):
+    """
+    Converts euler roll, pitch, yaw to quaternion
+    """
+    cy = math.cos(yaw * 0.5)
+    sy = math.sin(yaw * 0.5)
+    cp = math.cos(pitch * 0.5)
+    sp = math.sin(pitch * 0.5)
+    cr = math.cos(roll * 0.5)
+    sr = math.sin(roll * 0.5)
+
+    q = Quaternion()
+    q.w = cy * cp * cr + sy * sp * sr
+    q.x = cy * cp * sr - sy * sp * cr
+    q.y = sy * cp * sr + cy * sp * cr
+    q.z = sy * cp * cr - cy * sp * sr
+    return q
 
 
 class RouteWaypointFollower(Node):

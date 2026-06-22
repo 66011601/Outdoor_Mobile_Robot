@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             # Real-hardware helper nodes go here (e.g. cmd_vel → MAVROS bridge).
+            'vo_plotter = dcvg_bringup.vo_plotter:main',
         ],
     },
 )
