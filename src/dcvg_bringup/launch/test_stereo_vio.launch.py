@@ -78,7 +78,7 @@ def generate_launch_description():
                 # passive IR stereo pair
                 'enable_infra1':                True,
                 'enable_infra2':                True,
-                'depth_module.infra_profile':   '848x480x30',
+                'depth_module.infra_profile':   '1280x720x30',
                 'depth_module.emitter_enabled': 0,      # 0=off → no projector dots
                 # not needed for VIO — keep bandwidth/CPU down
                 'enable_depth':                 False,
@@ -131,7 +131,7 @@ def generate_launch_description():
                 'Vis/MaxDepth':              '15.0',
                 'Vis/MinDepth':              '0.5',
                 'Vis/RoiRatios':             '0.0 0.0 0.0 0.10',
-                'GFTT/QualityLevel':         '0.001',
+                'GFTT/QualityLevel':         '0.0001',
                 'GFTT/MinDistance':          '10',
                 'Vis/CorFlowMaxLevel':       '5',
                 'OdomF2M/BundleAdjustment':  '0',
@@ -148,17 +148,27 @@ def generate_launch_description():
             ],
         ),
 
+        # ── 4. Keypoint overlay — depth-coloured features on the IR left image ──
+        # stereo_odometry detects keypoints on the LEFT IR image and publishes
+        # them on /odom_sensor_data/features, so the overlay draws on left_topic.
+        # max_depth matches Vis/MaxDepth above (15 m) so the colour scale lines up.
         Node(
             package='dcvg_bringup',
             executable='stereo_feature_overlay',
             name='stereo_feature_overlay',
-            output='log',
+            output='screen',
+            parameters=[{
+                'image_topic': left_topic,
+                'pub_topic':   '/keypoints',
+                'max_depth':   15.0,
+                'max_fps':     5.0,
+            }],
         ),
 
         Node(
             package='rqt_image_view',
             executable='rqt_image_view',
             name='view_features_stereo',
-            arguments=['/d457/stereo_features'],
+            arguments=['/keypoints'],
         ),
     ])
