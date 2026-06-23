@@ -24,8 +24,14 @@ production dcvg_bringup/rtabmap.launch.py on two points:
   - publish_tf := True        (so odom→camera_link shows the camera moving in
     RViz; in production publish_tf=False because the EKF owns that transform)
 
-Run:
+Run (replay a recorded bag — the default):
   ros2 launch dcvg_bringup test_stereo_vio.launch.py
+
+Run against a LIVE camera instead of the bag:
+  ros2 launch dcvg_bringup test_stereo_vio.launch.py use_bag:=False
+
+Replay a different bag:
+  ros2 launch dcvg_bringup test_stereo_vio.launch.py bag_path:=/abs/path/to/bag
 
 Verify:
   ros2 topic hz /vo                 # should be ~camera frame rate when moving
@@ -38,9 +44,12 @@ Override topic names if your driver namespaces differ (e.g. D457):
        left_topic:=/camera/camera/infra1/image_rect_raw ...
 """
 
+import os
+
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.conditions import IfCondition, UnlessCondition
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
 
@@ -51,6 +60,17 @@ def generate_launch_description():
     right_info_topic = LaunchConfiguration('right_info_topic')
     imu_raw_topic    = LaunchConfiguration('imu_raw_topic')
     frame_id         = LaunchConfiguration('frame_id')
+    use_bag          = LaunchConfiguration('use_bag')
+    bag_path         = LaunchConfiguration('bag_path')
+
+    # When replaying a bag we run on the bag's /clock (use_sim_time=True);
+    # against a live camera we use wall time (use_sim_time=False).
+    use_sim_time = PythonExpression([use_bag])
+
+    # Default bag = the recorded IR-stereo+IMU route shipped in src/my_route.
+    default_bag = os.path.join(
+        os.path.expanduser('~'),
+        'internship_project', 'diff_drive_ws', 'src', 'my_route')
 
     return LaunchDescription([
 
@@ -64,11 +84,27 @@ def generate_launch_description():
         DeclareLaunchArgument('frame_id', default_value='camera_link',
             description='TF frame for odometry; camera_link for a standalone '
                         'camera, base_footprint when the robot URDF is running'),
+        DeclareLaunchArgument('use_bag', default_value='True',
+            description='True → replay bag_path; False → run the live RealSense driver'),
+        DeclareLaunchArgument('bag_path', default_value=default_bag,
+            description='rosbag2 directory to replay when use_bag:=True'),
 
-        # ── 1. RealSense driver — IR stereo pair + IMU, emitter off ─────────
+        # ── 1a. Bag replay — feeds the recorded IR pair + camera_info + IMU ──
+        #    --clock publishes /clock so the VIO nodes (use_sim_time=True) stay
+        #    in sync; --loop keeps the bench test running for repeated viewing.
+        ExecuteProcess(
+            condition=IfCondition(use_bag),
+            cmd=['ros2', 'bag', 'play', bag_path, '--clock', '--loop'],
+            output='screen',
+        ),
+
+        
+
+        # ── 1b. RealSense driver — IR stereo pair + IMU, emitter off ────────
         # Run the node directly (not rs_launch.py) so we can set
         # depth_module.emitter_enabled, which rs_launch does not expose.
         Node(
+            condition=UnlessCondition(use_bag),
             package='realsense2_camera',
             executable='realsense2_camera_node',
             namespace='camera',
@@ -97,6 +133,7 @@ def generate_launch_description():
             name='imu_filter',
             output='screen',
             parameters=[{
+                'use_sim_time':  use_sim_time,
                 'use_mag':       False,   # RealSense has no magnetometer
                 'world_frame':   'enu',
                 'publish_tf':    False,
@@ -114,7 +151,7 @@ def generate_launch_description():
             name='stereo_odometry',
             output='screen',
             parameters=[{
-                'use_sim_time':              False,
+                'use_sim_time':              use_sim_time,
                 'frame_id':                  frame_id,
                 'odom_frame_id':             'odom',
                 'publish_tf':                True,    # bench: visualise in RViz
@@ -152,23 +189,24 @@ def generate_launch_description():
         # stereo_odometry detects keypoints on the LEFT IR image and publishes
         # them on /odom_sensor_data/features, so the overlay draws on left_topic.
         # max_depth matches Vis/MaxDepth above (15 m) so the colour scale lines up.
-        Node(
-            package='dcvg_bringup',
-            executable='stereo_feature_overlay',
-            name='stereo_feature_overlay',
-            output='screen',
-            parameters=[{
-                'image_topic': left_topic,
-                'pub_topic':   '/keypoints',
-                'max_depth':   15.0,
-                'max_fps':     5.0,
-            }],
-        ),
+        # Node(
+        #     package='dcvg_bringup',
+        #     executable='stereo_feature_overlay',
+        #     name='stereo_feature_overlay',
+        #     output='screen',
+        #     parameters=[{
+        #         'use_sim_time': use_sim_time,
+        #         'image_topic': left_topic,
+        #         'pub_topic':   '/keypoints',
+        #         'max_depth':   15.0,
+        #         'max_fps':     5.0,
+        #     }],
+        # ),
 
-        Node(
-            package='rqt_image_view',
-            executable='rqt_image_view',
-            name='view_features_stereo',
-            arguments=['/keypoints'],
-        ),
+        # Node(
+        #     package='rqt_image_view',
+        #     executable='rqt_image_view',
+        #     name='view_features_stereo',
+        #     arguments=['/keypoints'],
+        # ),
     ])
