@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             # Real-hardware helper nodes go here (e.g. cmd_vel → MAVROS bridge).
+            'cmd_vel_to_teensy = dcvg_bringup.cmd_vel_to_teensy:main',
             'vo_plotter = dcvg_bringup.vo_plotter:main',
             'stereo_feature_overlay = dcvg_bringup.stereo_feature_overlay:main',
         ],

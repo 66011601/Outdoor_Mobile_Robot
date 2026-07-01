@@ -160,7 +160,7 @@ def generate_launch_description():
                 'subscribe_imu':             True,
                 # cameras ~30 Hz, IMU ~200 Hz → never share an exact stamp;
                 # approx sync with a 50 ms window pairs each frame with an IMU msg
-                'approx_sync':               True,
+                'approx_sync':               False,
                 'approx_sync_max_interval':  0.05,
                 'wait_imu_to_init':          True,
                 'Odom/Strategy':             '1',     # frame-to-frame (outdoor robust)
@@ -189,24 +189,24 @@ def generate_launch_description():
         # stereo_odometry detects keypoints on the LEFT IR image and publishes
         # them on /odom_sensor_data/features, so the overlay draws on left_topic.
         # max_depth matches Vis/MaxDepth above (15 m) so the colour scale lines up.
-        # Node(
-        #     package='dcvg_bringup',
-        #     executable='stereo_feature_overlay',
-        #     name='stereo_feature_overlay',
-        #     output='screen',
-        #     parameters=[{
-        #         'use_sim_time': use_sim_time,
-        #         'image_topic': left_topic,
-        #         'pub_topic':   '/keypoints',
-        #         'max_depth':   15.0,
-        #         'max_fps':     5.0,
-        #     }],
-        # ),
+        Node(
+            package='dcvg_bringup',
+            executable='stereo_feature_overlay',
+            name='stereo_feature_overlay',
+            output='screen',
+            parameters=[{
+                'use_sim_time': use_sim_time,
+                'image_topic': left_topic,
+                'pub_topic':   '/keypoints',
+                'max_depth':   15.0,
+                'max_fps':     5.0,
+            }],
+        ),
 
-        # Node(
-        #     package='rqt_image_view',
-        #     executable='rqt_image_view',
-        #     name='view_features_stereo',
-        #     arguments=['/keypoints'],
-        # ),
+        Node(
+            package='rqt_image_view',
+            executable='rqt_image_view',
+            name='view_features_stereo',
+            arguments=['/keypoints'],
+        ),
     ])
