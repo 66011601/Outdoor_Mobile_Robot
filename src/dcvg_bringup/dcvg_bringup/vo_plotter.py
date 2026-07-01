@@ -29,6 +29,10 @@ Run (with test_stereo_vio.launch.py already publishing /vo):
   ros2 run dcvg_bringup vo_plotter --ros-args -p topic:=/odometry/local -p label:=ekf
   ros2 run dcvg_bringup vo_plotter --ros-args -p jump_thresh:=0.5 -p cov_reset_thresh:=1000.0
 
+SSH / headless mode (no display):
+  ros2 run dcvg_bringup vo_plotter --ros-args -p headless:=true
+  Collects data without opening any window; press Ctrl+C to save PNG + CSV and exit.
+
 A clean VIO trace looks smooth and returns near (0,0) when you bring the camera
 back to start; jumps/spikes mean tracking loss, big return error means drift, and
 a steeply climbing reset count means VIO is unreliable in that condition.
@@ -85,12 +89,14 @@ class VoPlotter(Node):
         self.declare_parameter('output_dir', OUTPUT_DIR)
         self.declare_parameter('jump_thresh', JUMP_THRESH)
         self.declare_parameter('cov_reset_thresh', COV_RESET_THRESH)
+        self.declare_parameter('headless', False)
         self._topic = str(self.get_parameter('topic').value)
         self._label = str(self.get_parameter('label').value)
         self._output_dir = os.path.expanduser(
             str(self.get_parameter('output_dir').value))
         self._jump_thresh = float(self.get_parameter('jump_thresh').value)
         self._cov_thresh = float(self.get_parameter('cov_reset_thresh').value)
+        self._headless = bool(self.get_parameter('headless').value)
 
         # Shared with the GUI thread — guard every access with the lock.
         self._lock = threading.Lock()
@@ -110,10 +116,11 @@ class VoPlotter(Node):
         self._t0: float | None = None
 
         self.create_subscription(Odometry, self._topic, self._cb, 50)
+        mode = 'headless' if self._headless else 'live window'
         self.get_logger().info(
-            f"[vo_plotter] plotting '{self._topic}' (label '{self._label}'). "
+            f"[vo_plotter] plotting '{self._topic}' (label '{self._label}', {mode}). "
             f"reset if jump>{self._jump_thresh} m or cov>{self._cov_thresh}. "
-            f"Close the window or Ctrl+C to save.")
+            f"Ctrl+C to save.")
 
     def _cb(self, msg: Odometry):
         x = msg.pose.pose.position.x
@@ -290,6 +297,24 @@ def _draw_resets(ax, step, reset_ts, n_reset, rate):
 def main():
     rclpy.init()
     node = VoPlotter()
+
+    if node._headless:
+        # No display available (SSH). Switch to a non-interactive backend so that
+        # node.save() can still render and write the PNG without a GUI.
+        plt.switch_backend('agg')
+        node.get_logger().info('[vo_plotter] headless — collecting data, Ctrl+C to save')
+        try:
+            rclpy.spin(node)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            node.save()
+            node.destroy_node()
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
+        return
 
     # rclpy spins in a background thread; matplotlib owns the main thread so its
     # GUI event loop stays responsive.
