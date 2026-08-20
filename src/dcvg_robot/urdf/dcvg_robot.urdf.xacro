@@ -65,7 +65,7 @@
 
   <!-- Depth camera (D455: 124×26×25 mm, 87° H-FOV, depth 0.6-6 m) -->
   <xacro:property name="cam_x"          value="0.52"/>
-  <xacro:property name="cam_z"          value="0.60"/>
+  <xacro:property name="cam_z"          value="0.82"/>
   <xacro:property name="cam_size_x"     value="0.026"/>
   <xacro:property name="cam_size_y"     value="0.124"/>
   <xacro:property name="cam_size_z"     value="0.025"/>
@@ -349,6 +349,20 @@
     <origin xyz="0 0 0" rpy="0 0 0"/>
   </joint>
   <link name="gps_link"/>
+
+  <!-- GPS heading antenna (rover/moving-baseline board, simpleRTK2B Heading kit)
+       — placeholder, no visual. Identity transform to base_link is intentional,
+       not a lazy placeholder: gps_heading_to_imu.py's heading_offset_deg param
+       already corrects for the real antenna-mounting misalignment before
+       publishing yaw, so this frame only needs to RESOLVE (so robot_localization's
+       TF lookup for the /gps/heading/imu orientation fusion succeeds) — modeling
+       the real physical baseline offset between the two antennas isn't needed. -->
+  <joint name="gps_heading_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="gps_heading_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+  <link name="gps_heading_link"/>
 
   <!-- IMU -->
   <joint name="base_link_to_imu" type="fixed">

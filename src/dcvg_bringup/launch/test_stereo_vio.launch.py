@@ -71,7 +71,7 @@ def generate_launch_description():
     # Default bag = the recorded IR-stereo+IMU route shipped in src/my_route.
     default_bag = os.path.join(
         os.path.expanduser('~'),
-        'internship_project', 'diff_drive_ws', 'src', 'my_route')
+        'dcvg_robot', 'src', 'my_route')
 
     return LaunchDescription([
 

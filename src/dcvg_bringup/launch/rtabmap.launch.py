@@ -133,23 +133,32 @@ def generate_launch_description():
         ),
 
         # ── Ground-filtered obstacle cloud ────────────────────────────────
-        # On real hardware the depth cloud DOES carry normals, so you can switch
-        # Grid/NormalsSegmentation back to 'true' for better slope handling.
+        # NOTE: RTAB-Map 0.22 (installed) exposes these under the "Grid/" prefix,
+        # NOT "Proj/" — the previous "Proj/*" keys here were unrecognized and
+        # silently ignored, which combined with NormalsSegmentation:'false' left
+        # Grid/MaxGroundHeight at its disabled default (0.0) i.e. NO ground
+        # filtering was actually happening. Fixed to real keys + normals-based
+        # segmentation (RTAB-Map's own default, and more robust to the grazing-
+        # angle depth noise a level, elevated camera sees on distant ground).
         Node(
             package='rtabmap_util',
             executable='obstacles_detection',
             name='obstacles_detection',
             output='log',
             parameters=[{
-                'use_sim_time':             use_sim_time,
-                'frame_id':                 'base_footprint',
-                'map_frame_id':             'map',
-                'wait_for_transform':       0.2,
-                'Grid/NormalsSegmentation': 'false',   # revisit on real HW (normals available)
-                'Proj/MaxGroundHeight':     '0.1',
-                'Proj/MaxGroundAngle':      '45.0',
-                'Proj/MinClusterSize':      '20',
-                'Proj/MaxObstacleHeight':   '2.0',
+                'use_sim_time':                   use_sim_time,
+                'frame_id':                       'base_footprint',
+                'map_frame_id':                   'map',
+                'wait_for_transform':             0.2,
+                'Grid/NormalsSegmentation':       'true',
+                'Grid/MaxGroundAngle':            '45.0',
+                'Grid/NormalK':                   '20',
+                'Grid/ClusterRadius':             '0.1',
+                'Grid/MinClusterSize':            '20',
+                'Grid/MaxObstacleHeight':         '2.0',
+                'Grid/MaxGroundHeight':           '0.1',   # fallback only; unused while NormalsSegmentation=true
+                'Grid/NoiseFilteringRadius':      '0.1',   # drop sparse speckle points before classification
+                'Grid/NoiseFilteringMinNeighbors':'5',
             }],
             remappings=[
                 ('cloud',     points_topic),

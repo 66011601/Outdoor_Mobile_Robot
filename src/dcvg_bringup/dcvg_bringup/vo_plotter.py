@@ -2,9 +2,8 @@
 vo_plotter.py  (REAL HARDWARE — VIO inspection)
 
 Live multi-panel inspection of a visual-odometry stream, for eyeballing how good
-the odometry is while you move the camera/robot by hand. Unlike the sim-only
-dcvg_robot/odom_accuracy_plot.py, this needs NO ground truth — it just reads an
-Odometry topic (default /vo) as it arrives and draws:
+the odometry is while you move the camera/robot by hand. Needs NO ground truth —
+it just reads an Odometry topic (default /vo) as it arrives and draws:
 
   - XY trajectory (start dot, current dot, reset markers)
   - Linear velocity (twist.linear.x) vs time

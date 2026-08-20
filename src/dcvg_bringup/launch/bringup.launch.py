@@ -1,19 +1,46 @@
 """
 bringup.launch.py  (REAL HARDWARE — top-level entry point)
 
-Real-robot counterpart of dcvg_robot/gps_waypoint_follower.launch.py. Instead of
-Gazebo, it starts the real sensor drivers + MAVROS, then the SAME shared stack
-(RTAB-Map VIO + dual EKF + Nav2) the simulation already validated.
+Top-level real-robot entry point: starts the real sensor drivers + GPS/RTK + Teensy
+motor bridge, then the shared stack (RTAB-Map VIO + dual EKF + Nav2) — the same
+architecture dcvg_robot's Gazebo simulation was used to design and validate
+against (dcvg_robot no longer carries a runnable Gazebo sim; see CLAUDE.md).
+
+No Pixhawk/MAVROS in this build: motor commands go straight to a Teensy over serial
+(low_level_command), and GPS+RTK comes directly from the simpleRTK2B Heading (u-blox
+ZED-F9P) via ublox_gps + ntrip_client, not through a flight controller.
 
 Chain:
-  1. robot_state_publisher  → publishes the robot TF tree (frames for camera/lidar/imu)
-  2. sensors.launch.py      → RealSense + RPLIDAR drivers
-  3. mavros.launch.py       → Pixhawk bridge (GPS in, cmd_vel out)
-  4. localization.launch.py → dual EKF + navsat_transform
-  5. rtabmap.launch.py      → /vo + /camera/depth/obstacles
-  6. nav2_bringup           → full Nav2 stack with the custom recovery BTs
+  1. robot_state_publisher  → publishes the robot TF tree (frames for camera/imu; no LiDAR)
+  2. sensors.launch.py      → RealSense driver + IMU orientation filter
+  3. ublox_gps.launch.py    → position (/dev/ttyGPS_movingbase) + heading (/dev/ttyGPS_rover)
+                              F9P boards → /gps/fix, /gps/vel, /gps/heading/navrelposned
+                              → gps_heading_to_imu → /gps/heading/imu (yaw, fused in step 6)
+  4. ntrip.launch.py        → NTRIP RTK corrections → the position board (FLOAT/FIXED)
+  5. low_level_command      → /cmd_vel → serial (/dev/ttyTeensy) → Teensy → Pololu motor drivers
+  6. localization.launch.py → dual EKF + navsat_transform
+  7. rtabmap.launch.py      → /vo + /camera/depth/obstacles
+  8. nav2_bringup           → full Nav2 stack with the custom recovery BTs
 
 Everything runs with use_sim_time:=False.
+
+Staggered startup: launching everything at once has been observed to throw errors on
+this hardware (drivers racing for serial ports before udev settles, RTAB-Map/Nav2
+subscribing before their upstream topics exist, etc.). Each stage above is wrapped in
+a TimerAction so it starts only after the previous stage has had time to come up
+cleanly, rather than all-at-once. Total time to Nav2 coming up is ~20s by default —
+slower, but stable. Tune via the *_delay launch args below if a stage still races on
+your hardware (bump the delay after it) or if you want a faster start once you've
+confirmed it's reliable (shrink the delays).
+
+Serial ports (fixed on this robot via /etc/udev/rules.d/99-usb-serial.rules —
+keyed on physical USB port / vendor+serial, NOT raw ttyACM*/ttyUSB* enumeration
+order, which drifts across replugs/reboots):
+  /dev/ttyGPS_movingbase — GPS position board (big board, simpleRTK2B Heading)
+  /dev/ttyGPS_rover      — GPS heading board (small board)
+  /dev/ttyTeensy         — Teensy (low_level_command)
+Override any of them with the gps_device / gps_heading_device / teensy_port args
+if a device ever needs a one-off different path.
 
 Usage:
   ros2 launch dcvg_bringup bringup.launch.py
@@ -24,7 +51,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import Command, LaunchConfiguration
@@ -63,8 +90,42 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='False'),
-        DeclareLaunchArgument('use_stereo',   default_value='false'),
+        DeclareLaunchArgument('use_stereo',   default_value='True'),
         DeclareLaunchArgument('use_rviz',     default_value='False'),
+        DeclareLaunchArgument('teensy_port',  default_value='/dev/ttyTeensy',
+            description='Teensy serial device for low_level_command'),
+        DeclareLaunchArgument('gps_device',   default_value='/dev/ttyGPS_movingbase',
+            description='Position board (big board) F9P serial port'),
+        DeclareLaunchArgument('gps_heading_device', default_value='/dev/ttyGPS_rover',
+            description='Heading board (small board) F9P serial port'),
+        DeclareLaunchArgument('heading_offset_deg', default_value='0.0',
+            description='GPS heading antenna mounting offset (deg) — calibrate against '
+                        'a known heading once on hardware, see gps_heading_to_imu.py'),
+        DeclareLaunchArgument('min_heading_std_deg', default_value='2.0',
+            description='Floor on GPS-heading yaw std-dev — realistic sensor-accuracy '
+                        'floor; see gps_heading_to_imu.py for why this no longer needs '
+                        'to be inflated for feedback-loop damping'),
+
+        # --- Staggered-startup delays (seconds, measured from bringup launch) ---
+        # Each stage waits for the one before it to be up before starting, instead of
+        # everything racing at t=0. Bump a delay if that stage still errors on startup;
+        # shrink it once you've confirmed the stage comes up reliably before it fires.
+        DeclareLaunchArgument('sensors_delay', default_value='2.0',
+            description='Delay before starting the RealSense driver + IMU filter'),
+        DeclareLaunchArgument('gps_delay', default_value='12.0',
+            description='Delay before starting the GPS/RTK drivers (after RealSense init)'),
+        DeclareLaunchArgument('ntrip_delay', default_value='9.0',
+            description='Delay before starting the NTRIP client (needs GPS driver + fix)'),
+        DeclareLaunchArgument('motor_delay', default_value='9.0',
+            description='Delay before starting low_level_command (independent of GPS/NTRIP)'),
+        DeclareLaunchArgument('localization_delay', default_value='12.0',
+            description='Delay before starting the dual EKF + navsat_transform'),
+        DeclareLaunchArgument('rtabmap_delay', default_value='16.0',
+            description='Delay before starting RTAB-Map (needs camera topics flowing)'),
+        DeclareLaunchArgument('nav2_delay', default_value='21.0',
+            description='Delay before starting Nav2 (needs TF tree + odometry + costmap sources up)'),
+        DeclareLaunchArgument('rviz_delay', default_value='22.0',
+            description='Delay before starting RViz'),
         # TODO: split a hardware-specific (Gazebo-free) robot description out of the
         # sim package. For now reuse the sim xacro — robot_state_publisher ignores
         # the <gazebo> plugin tags, so the TF tree it publishes is correct.
@@ -74,6 +135,7 @@ def generate_launch_description():
                 get_package_share_directory('dcvg_robot'), 'urdf', 'dcvg_robot.urdf.xacro'),
             description='Robot xacro/urdf for the TF tree'),
 
+        # Starts immediately — everything else keys its delay off this being first.
         Node(
             package='robot_state_publisher',
             executable='robot_state_publisher',
@@ -82,38 +144,81 @@ def generate_launch_description():
                          'use_sim_time': use_sim_time}],
         ),
 
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(os.path.join(launch_dir, 'sensors.launch.py')),
+        TimerAction(
+            period=LaunchConfiguration('ntrip_delay'),
+            actions=[IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(os.path.join(launch_dir, 'ntrip.launch.py')),
+                launch_arguments={'device': LaunchConfiguration('gps_device')}.items(),
+            )],
         ),
 
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(os.path.join(launch_dir, 'mavros.launch.py')),
+        TimerAction(
+            period=LaunchConfiguration('gps_delay'),
+            actions=[IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(os.path.join(launch_dir, 'ublox_gps.launch.py')),
+                launch_arguments={
+                    'device': LaunchConfiguration('gps_device'),
+                    'heading_device': LaunchConfiguration('gps_heading_device'),
+                    'heading_offset_deg': LaunchConfiguration('heading_offset_deg'),
+                    'min_heading_std_deg': LaunchConfiguration('min_heading_std_deg'),
+                }.items(),
+            )],
         ),
 
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(os.path.join(launch_dir, 'localization.launch.py')),
-            launch_arguments={'use_sim_time': use_sim_time}.items(),
+        TimerAction(
+            period=LaunchConfiguration('motor_delay'),
+            actions=[Node(
+                package='dcvg_bringup',
+                executable='low_level_command',
+                name='low_level_command',
+                output='screen',
+                parameters=[{'port': LaunchConfiguration('teensy_port')}],
+            )],
         ),
 
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(os.path.join(launch_dir, 'rtabmap.launch.py')),
-            launch_arguments={'use_sim_time': use_sim_time,
-                              'use_stereo': use_stereo}.items(),
+        TimerAction(
+            period=LaunchConfiguration('sensors_delay'),
+            actions=[IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(os.path.join(launch_dir, 'sensors.launch.py')),
+            )],
         ),
 
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(
-                os.path.join(bringup_dir, 'launch', 'navigation_launch.py')),
-            launch_arguments={
-                'use_sim_time': use_sim_time,
-                'params_file': configured_params,
-                'autostart': 'True',
-            }.items(),
+        TimerAction(
+            period=LaunchConfiguration('localization_delay'),
+            actions=[IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(os.path.join(launch_dir, 'localization.launch.py')),
+                launch_arguments={'use_sim_time': use_sim_time}.items(),
+            )],
         ),
 
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(
-                os.path.join(bringup_dir, 'launch', 'rviz_launch.py')),
-            condition=IfCondition(use_rviz),
+        TimerAction(
+            period=LaunchConfiguration('rtabmap_delay'),
+            actions=[IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(os.path.join(launch_dir, 'rtabmap.launch.py')),
+                launch_arguments={'use_sim_time': use_sim_time,
+                                  'use_stereo': use_stereo}.items(),
+            )],
+        ),
+
+        TimerAction(
+            period=LaunchConfiguration('nav2_delay'),
+            actions=[IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(bringup_dir, 'launch', 'navigation_launch.py')),
+                launch_arguments={
+                    'use_sim_time': use_sim_time,
+                    'params_file': configured_params,
+                    'autostart': 'True',
+                }.items(),
+            )],
+        ),
+
+        TimerAction(
+            period=LaunchConfiguration('rviz_delay'),
+            actions=[IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(bringup_dir, 'launch', 'rviz_launch.py')),
+                condition=IfCondition(use_rviz),
+            )],
         ),
     ])

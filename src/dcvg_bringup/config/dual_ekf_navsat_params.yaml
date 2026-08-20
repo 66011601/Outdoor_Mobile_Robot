@@ -1,12 +1,28 @@
-# Fix #1: Clean architectural separation
-#   ekf_local  (world=odom): VIO velocity + IMU yaw ONLY → smooth local frame
-#   ekf_global (world=map):  GPS position + IMU yaw ONLY → zero-drift global frame
+# Architecture
+#   ekf_local  (world=odom): VIO velocity + camera-gyro yaw (rate+absolute) +
+#                            GPS moving-baseline heading (absolute, accurate) →
+#                            smooth AND accurate local frame
+#   ekf_global (world=map):  GPS position + GPS velocity + camera-gyro yaw
+#                            RATE ONLY (not absolute) → zero-drift global frame
 #
 # GPS does not drift — each fix is an independent absolute reading.
 # VIO drifts — small per-frame errors compound over distance.
 # Mixing VIO into ekf_global contaminates the GPS-accurate global frame with drift.
 # Keeping VIO in ekf_local only gives you smooth interpolation between GPS updates
 # while the global frame stays GPS-anchored with zero cumulative error.
+#
+# Yaw is split differently than position, and for a specific, root-caused reason
+# (see the imu0 comment in ekf_filter_node_map below): fusing a continuously-
+# updating ABSOLUTE yaw source into ekf_global creates a feedback loop through
+# the map->odom transform it both publishes and uses to interpret its own
+# position corrections. This has nothing to do with sensor accuracy — it
+# happened with GPS heading AND with camera-gyro, both diverged. So the
+# accurate absolute yaw source (GPS moving-baseline heading) lives in
+# ekf_local instead (safe there — that EKF's odom0 never self-references),
+# and ekf_global gets only camera-gyro angular VELOCITY, which satisfies
+# robot_localization's own requirement that yaw or its velocity be observed
+# without ever touching the risky path. osm_route_app reads /odometry/local,
+# not /odometry/global, for its displayed heading because of this split.
 
 ekf_filter_node_odom:
   ros__parameters:
@@ -33,17 +49,28 @@ ekf_filter_node_odom:
     odom0_queue_size: 10
     odom0_differential: false
     odom0_relative: false
-
-    imu0: imu/data
+    
+    imu0: imu/data_throttled
     imu0_config: [false, false, false,
+                  false, false, false,
+                  false, false, false,
                   false, false, true,
-                  false, false, false,
-                  false, false, false,
                   false, false, false]
     imu0_differential: false
     imu0_relative: false
     imu0_queue_size: 10
     imu0_remove_gravitational_acceleration: true
+
+    imu1: gps/heading/imu
+    imu1_config: [false, false, false,
+                  false, false, true,
+                  false, false, false,
+                  false, false, false,
+                  false, false, false]
+    imu1_differential: false
+    imu1_relative: false
+    imu1_queue_size: 10
+    imu1_remove_gravitational_acceleration: false
 
     use_control: false
 
@@ -76,9 +103,6 @@ ekf_filter_node_map:
     base_link_frame: base_footprint
     world_frame: map
 
-    # GPS absolute position only — the sole position source for the global frame.
-    # No VIO here: mixing in VIO would contaminate the GPS-accurate global frame
-    # with cumulative drift. GPS alone guarantees zero drift over any distance.
     odom0: odometry/gps
     odom0_config: [true,  true,  false,
                   false, false, false,
@@ -89,36 +113,62 @@ ekf_filter_node_map:
     odom0_differential: false
     odom0_relative: false
 
-    imu0: imu/data
+    # odom1: vo
+    # odom1_config: [false,  false,  false,
+    #               false, false, false,
+    #               true, true, true,
+    #               false, false, true,
+    #               false, false, false]
+    # odom1_queue_size: 10
+    # odom1_differential: false
+    # odom1_relative: false
+
+    # twist0: vo
+    # twist0: [false, false, false,
+    #         false, false, false,
+    #         true,  true,  true,
+    #         false, false, true,
+    #         false, false, false]
+    # twist0_queue_size: 10
+
+    imu0: imu/data_throttled
     imu0_config: [false, false, false,
+                  false, false, false,
+                  false, false, false,
                   false, false, true,
-                  false, false, false,
-                  false, false, false,
                   false, false, false]
     imu0_differential: false
     imu0_relative: false
     imu0_queue_size: 10
     imu0_remove_gravitational_acceleration: true
 
+    imu1: gps/heading/imu
+    imu1_config: [false, false, false,
+                  false, false, true,
+                  false, false, false,
+                  false, false, false,
+                  false, false, false]
+    imu1_differential: false
+    imu1_relative: false
+    imu1_queue_size: 10
+    imu1_remove_gravitational_acceleration: false
+
     use_control: false
 
-    # Tighter process noise for x/y: GPS fires at 5 Hz (0.2 s between fixes).
-    # At 0.05 the filter allows 0.05×0.2 = 0.01 m² of wander per interval → ~10 cm.
-    # At 0.01 that drops to ~2 cm, matching RTK GPS accuracy.
-    process_noise_covariance: [0.2, 0.0,   0.0,   0.0,  0.0,   0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
-                               0.0,  0.2,  0.0,   0.0,  0.0,   0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+    process_noise_covariance: [0.01, 0.0,   0.0,   0.0,  0.0,   0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.01,  0.0,   0.0,  0.0,   0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
                                0.0,  0.0,   1e-3,  0.0,  0.0,   0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
                                0.0,  0.0,   0.0,   0.3,  0.0,   0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
                                0.0,  0.0,   0.0,   0.0,  0.3,   0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
                                0.0,  0.0,   0.0,   0.0,  0.0,   0.01, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
-                               0.0,  0.0,   0.0,   0.0,  0.0,   0.0,  0.5,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
-                               0.0,  0.0,   0.0,   0.0,  0.0,   0.0,  0.0,  0.5,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,   0.0,   0.0,  0.0,   0.0,  0.01, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,   0.0,   0.0,  0.0,   0.0,  0.0,  0.01, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
                                0.0,  0.0,   0.0,   0.0,  0.0,   0.0,  0.0,  0.0,  0.1,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
                                0.0,  0.0,   0.0,   0.0,  0.0,   0.0,  0.0,  0.0,  0.0,  0.3,  0.0,  0.0,  0.0,  0.0,  0.0,
                                0.0,  0.0,   0.0,   0.0,  0.0,   0.0,  0.0,  0.0,  0.0,  0.0,  0.3,  0.0,  0.0,  0.0,  0.0,
-                               0.0,  0.0,   0.0,   0.0,  0.0,   0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.3,  0.0,  0.0,  0.0,
-                               0.0,  0.0,   0.0,   0.0,  0.0,   0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.3,  0.0,  0.0,
-                               0.0,  0.0,   0.0,   0.0,  0.0,   0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.3,  0.0,
+                               0.0,  0.0,   0.0,   0.0,  0.0,   0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.01, 0.0,  0.0,  0.0,
+                               0.0,  0.0,   0.0,   0.0,  0.0,   0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.01, 0.0,  0.0,
+                               0.0,  0.0,   0.0,   0.0,  0.0,   0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.01, 0.0,
                                0.0,  0.0,   0.0,   0.0,  0.0,   0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.3]
 
 navsat_transform:
@@ -128,7 +178,7 @@ navsat_transform:
     magnetic_declination_radians: 0.0
     yaw_offset: 0.0
     zero_altitude: true
-    broadcast_utm_transform: true
+    broadcast_cartesian_transform: true
     publish_filtered_gps: true
     use_odometry_yaw: true
     wait_for_datum: false

@@ -15,14 +15,8 @@
   <depend>tf2_ros</depend>
   <depend>tf2_geometry_msgs</depend>
   <depend>nav2_msgs</depend>
-  <depend>robot_state_publisher</depend>
-  <depend>xacro</depend>
   <depend>navigation2</depend>
   <depend>robot_localization</depend>
-  <depend>nav2_route</depend>
-  <depend>mapviz</depend>
-  <depend>mapviz_plugins</depend>
-  <depend>tile_map</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

@@ -1,8 +1,19 @@
 """
 osm_route_app.py — Interactive web UI for route planning and waypoint editing.
 
+Talks to the real-hardware navigation stack (`dcvg_bringup bringup.launch.py`)
+purely over its ROS topic contract (`/gps/fix`, `/odometry/global`, `/cmd_vel`,
+a camera image topic) — see the "Sensor Topics" table in CLAUDE.md. It also
+spawns/kills `route_waypoint_follower` itself (via Start/Pause/Stop in the UI).
+
+The default camera topic, `/camera/color/image_raw`, matches dcvg_bringup's
+RGBD default (`rtabmap.launch.py`'s `rgb_topic`). Stereo mode
+(`use_stereo:=true`) uses `/camera/infra1/image_rect_raw` instead — that's a
+ROS param, not a code change:
+
 Usage:
   ros2 run dcvg_robot osm_route_app
+  ros2 run dcvg_robot osm_route_app --ros-args -p camera_topic:=/camera/infra1/image_rect_raw  # stereo mode
   Then open:  http://localhost:5000
 """
 
@@ -30,8 +41,12 @@ _robot_pose = {'available': False, 'lat': 0.0, 'lon': 0.0, 'heading': 0.0,
 
 # Latest camera frame (JPEG bytes) for the monitoring screen. We only encode
 # frames while a viewer is connected (want_ts kept fresh by the stream endpoint).
-_CAMERA_TOPIC = '/d455/image_raw'
-_camera = {'jpeg': None, 'ts': 0.0, 'want_ts': 0.0}
+#
+# Default matches dcvg_bringup/launch/rtabmap.launch.py's rgb_topic default.
+# Override with a ROS param for stereo VIO (use_stereo:=true) — see the module
+# docstring above for the exact topic.
+_DEFAULT_CAMERA_TOPIC = '/camera/color/image_raw'
+_camera = {'jpeg': None, 'ts': 0.0, 'want_ts': 0.0, 'topic': _DEFAULT_CAMERA_TOPIC}
 
 # ---------------------------------------------------------------------------
 # Manual teleop (publishes /cmd_vel for over-control when nav is paused/stopped)
@@ -60,8 +75,11 @@ def _start_ros_monitor():
             from nav_msgs.msg import Odometry
             from sensor_msgs.msg import NavSatFix, Image
             from geometry_msgs.msg import Twist
-            rclpy.init()
+            rclpy.init(args=sys.argv)   # so --ros-args -p camera_topic:=... is honored
             node = rclpy.create_node('osm_route_monitor')
+
+            node.declare_parameter('camera_topic', _DEFAULT_CAMERA_TOPIC)
+            _camera['topic'] = str(node.get_parameter('camera_topic').value)
 
             def gps_cb(msg):
                 if msg.status.status >= 0:
@@ -79,6 +97,14 @@ def _start_ros_monitor():
 
             # Change '/gps/fix' if your GPS topic name differs
             node.create_subscription(NavSatFix, '/gps/fix', gps_cb, 10)
+            # ekf_local (odom frame), not ekf_global: dual_ekf_navsat_params.yaml fuses
+            # the accurate GPS moving-baseline heading (gps_heading_to_imu) into
+            # ekf_local's imu1 specifically because ekf_global can't safely carry a
+            # continuously-updating absolute yaw source (see that file's imu0 comment
+            # under ekf_filter_node_map for the root-caused reason — a feedback loop
+            # through the map->odom transform, unrelated to sensor accuracy).
+            # ekf_global's own orientation is therefore NOT accurate — only rate-bounded.
+            # Twist (lin/ang below) is reported in the body frame either way.
             node.create_subscription(Odometry, '/odometry/local', odom_cb, 10)
 
             # Camera → JPEG for the monitoring screen. Encoding only runs while a
@@ -103,7 +129,7 @@ def _start_ros_monitor():
                     except Exception:
                         pass
 
-                node.create_subscription(Image, _CAMERA_TOPIC, image_cb, 5)
+                node.create_subscription(Image, _camera['topic'], image_cb, 5)
             except Exception as cam_exc:
                 print(f'[osm_route_app] camera stream disabled: {cam_exc}')
 
@@ -368,10 +394,52 @@ def api_stops_config():
     return jsonify({'status': 'ok', 'count': len(data['stops'])})
 
 
+_WAYPOINT_SANITY_RADIUS_M = 2000.0   # beyond this, Start requires confirmation
+
+
+def _check_waypoint_sanity():
+    """Return the great-circle distance (m) from the robot's last GPS fix to
+    the current waypoints.yaml's first waypoint, if it's implausibly far —
+    else None. Guards against Start silently driving toward a stale/leftover
+    route left over from a different site or session."""
+    if not _robot_pose['available']:
+        return None
+    path = _find_config('waypoints.yaml')
+    if not path:
+        return None
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+        wps = data.get('waypoints', [])
+        if not wps:
+            return None
+        first = wps[0]
+        from dcvg_robot.osm_route_generator import haversine_distance
+        d = haversine_distance(_robot_pose['lat'], _robot_pose['lon'],
+                                float(first['latitude']), float(first['longitude']))
+        return d if d > _WAYPOINT_SANITY_RADIUS_M else None
+    except Exception:
+        return None
+
+
 @app.route('/api/nav/start', methods=['POST'])
 def api_nav_start():
     global _nav_proc, _nav_state
     _refresh_nav_state()
+    # get_json(silent=True): a bare POST (no body/content-type — e.g. a stale
+    # cached tab predating this endpoint's confirm_far body, or curl -X POST
+    # with nothing else) must still start navigation, not 500 on a safety-
+    # critical endpoint. request.json raises on that instead of returning None.
+    body = request.get_json(silent=True) or {}
+    if _nav_state != 'paused' and not body.get('confirm_far'):
+        far_m = _check_waypoint_sanity()
+        if far_m is not None:
+            return jsonify({
+                'error': 'far_start',
+                'message': f'Route start is {far_m / 1000:.1f} km from the '
+                           f'robot\'s last GPS fix.',
+                'distance_m': far_m,
+            }), 409
     if _nav_state == 'paused':
         _write_nav_cmd('run')
         _nav_state = 'running'
@@ -479,6 +547,13 @@ def api_teleop_disengage():
 @app.route('/api/robot_pose')
 def api_robot_pose():
     return jsonify(_robot_pose)
+
+
+@app.route('/api/camera_topic')
+def api_camera_topic():
+    """Topic the monitoring screen is actually subscribed to (see camera_topic
+    ROS param — differs between D455 RGBD / D457 stereo and any real-HW override)."""
+    return jsonify({'topic': _camera['topic']})
 
 
 @app.route('/api/camera')
@@ -927,7 +1002,7 @@ body{font-family:system-ui,sans-serif;font-size:13px;display:flex;height:100vh;o
       <span class="md-text" id="mon-dest-text">Waiting for destination…</span>
     </div>
     <div class="cam-wrap">
-      <div class="cam-off" id="cam-off">📷 Waiting for camera stream…<br><span style="font-size:11px">(topic /d455/image_raw)</span></div>
+      <div class="cam-off" id="cam-off">📷 Waiting for camera stream…<br><span style="font-size:11px">(topic <span id="cam-off-topic">/camera/color/image_raw</span>)</span></div>
       <img id="cam-stream" alt="" onload="document.getElementById('cam-off').style.display='none'"/>
     </div>
     <div id="mon-hud">
@@ -1876,13 +1951,27 @@ function showMonitor(active) {
   }
 }
 
-async function navStart() {
+async function navStart(confirmFar) {
   if (_teleopOn) await teleopOff();   // hand /cmd_vel back to Nav2 before it drives
   await saveStopsConfig();   // persist latest stop config before launching follower
   try {
-    const r = await fetch('/api/nav/start', {method:'POST'});
+    const r = await fetch('/api/nav/start', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({confirm_far: !!confirmFar})
+    });
     const d = await r.json();
-    if (!r.ok) { status('✗ ' + (d.error || 'Start failed'), 'err'); return; }
+    if (!r.ok) {
+      if (d.error === 'far_start') {
+        const km = (d.distance_m / 1000).toFixed(1);
+        if (confirm(`This route starts ${km} km from the robot's last known GPS position. Start anyway?`)) {
+          return navStart(true);
+        }
+        status('Start cancelled — route is far from the robot.', 'info');
+        return;
+      }
+      status('✗ ' + (d.error || 'Start failed'), 'err'); return;
+    }
     _applyNavState(d.state);
     status('Navigation started', 'ok');
   } catch(e) { status('✗ ' + e.message, 'err'); }
@@ -2115,6 +2204,16 @@ setInterval(async () => {
 // ═══════════════════════════════════════════════════════════════════
 (async () => {
   await loadStopsTopics();
+
+  // Camera topic in use can differ from the default (RGBD vs stereo, or a
+  // real-HW override) — reflect whatever camera_topic the node actually resolved.
+  try {
+    const r = await fetch('/api/camera_topic');
+    if (r.ok) {
+      const {topic} = await r.json();
+      if (topic) document.getElementById('cam-off-topic').textContent = topic;
+    }
+  } catch {}
 
   try {
     const r = await fetch('/api/config');

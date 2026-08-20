@@ -24,7 +24,10 @@ setup(
     license='TODO: License declaration',
     entry_points={
         'console_scripts': [
-            # Real-hardware helper nodes go here (e.g. cmd_vel → MAVROS bridge).
+            'low_level_command = dcvg_bringup.low_level_command:main',
+            'ntrip_bridge = dcvg_bringup.ntrip_bridge:main',
+            'gps_heading_to_imu = dcvg_bringup.gps_heading_to_imu:main',
+            'imu_throttle = dcvg_bringup.imu_throttle:main',
             'vo_plotter = dcvg_bringup.vo_plotter:main',
             'stereo_feature_overlay = dcvg_bringup.stereo_feature_overlay:main',
         ],

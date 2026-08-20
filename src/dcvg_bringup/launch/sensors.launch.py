@@ -2,16 +2,17 @@
 sensors.launch.py  (REAL HARDWARE)
 
 Brings up the perception sensor drivers on the Jetson:
-  - realsense2_camera  → RGB + depth + (camera) IMU  for VIO and obstacle cloud
-  - rplidar_ros        → 2D LiDAR scan, remapped to /lidar/scan (Nav2 costmap source)
+  - realsense2_camera    → RGB + depth + (camera) IMU  for VIO and obstacle cloud
+  - imu_filter_madgwick  → fuses the camera's raw accel+gyro into an oriented
+                           quaternion IMU on /imu/data (there is no Pixhawk in this
+                           build to source IMU/GPS from — see ublox_gps.launch.py
+                           for GPS)
 
-GPS is NOT here — it arrives through MAVROS from the Pixhawk (see mavros.launch.py).
-
-IMU NOTE (TBD): RTAB-Map wants an oriented IMU (with a quaternion). The RealSense
-publishes only raw accel+gyro. Either:
-  (a) run imu_filter_madgwick to fuse them into /imu/data (orientation), or
-  (b) use the Pixhawk IMU from MAVROS (/mavros/imu/data) instead.
-Pick one and make sure the chosen source ends up on /imu/data.
+No physical LiDAR in this build (RPLIDAR was dropped) — obstacle avoidance on
+real hardware is depth-camera-only via rtabmap.launch.py's obstacles_detection
+(/camera/depth/obstacles), capped at the RGBD camera's ~6 m outdoor range. See
+nav2_no_map_params.yaml (no `scan` observation source) and CLAUDE.md's Known
+Issues.
 
 ALL TOPIC/PORT VALUES ARE TBD — confirm against the connected hardware.
 """
@@ -23,14 +24,8 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    lidar_serial_port = LaunchConfiguration('lidar_serial_port')
-    lidar_baudrate    = LaunchConfiguration('lidar_baudrate')
 
     return LaunchDescription([
-        DeclareLaunchArgument('lidar_serial_port', default_value='/dev/ttyUSB0',
-            description='RPLIDAR S2 serial device (TBD — confirm on hardware)'),
-        DeclareLaunchArgument('lidar_baudrate', default_value='1000000',
-            description='RPLIDAR S2 baudrate (1 Mbaud)'),
 
         # ── Intel RealSense D455 / D457 ───────────────────────────────────
         # enable_gyro/accel + unite_imu_method produces a combined IMU stream.
@@ -39,7 +34,7 @@ def generate_launch_description():
             package='realsense2_camera',
             executable='realsense2_camera_node',
             name='camera',
-            namespace='camera',
+            namespace='',
             output='screen',
             parameters=[{
                 'enable_color':      True,
@@ -49,23 +44,24 @@ def generate_launch_description():
                 'enable_gyro':       True,
                 'enable_accel':      True,
                 'unite_imu_method':  2,       # 2 = linear interpolation → single /imu topic
-                'pointcloud.enable': True,
+                'pointcloud__neon_.enable': True,
                 'align_depth.enable': True,
             }],
         ),
 
-        # ── RPLIDAR S2 (2D LiDAR) ─────────────────────────────────────────
         Node(
-            package='rplidar_ros',
-            executable='rplidar_composition',
-            name='rplidar',
+            package='imu_filter_madgwick',
+            executable='imu_filter_madgwick_node',
+            name='imu_filter_madgwick',
             output='screen',
             parameters=[{
-                'serial_port':  lidar_serial_port,
-                'serial_baudrate': lidar_baudrate,
-                'frame_id':     'laser',
-                'scan_mode':    'DenseBoost',
+                'use_mag': False,
+                'publish_tf': False,
+                'world_frame': 'enu',
             }],
-            remappings=[('scan', '/lidar/scan')],
+            remappings=[
+                ('imu/data_raw', '/camera/imu'),
+                ('imu/data', '/imu/data'),
+            ],
         ),
     ])

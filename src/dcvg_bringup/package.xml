@@ -3,7 +3,7 @@
 <package format="3">
   <name>dcvg_bringup</name>
   <version>0.0.0</version>
-  <description>Real-hardware bringup for the DCVG autonomous rover (sensors + MAVROS + VIO + EKF + Nav2). dcvg_robot is the simulation counterpart.</description>
+  <description>Real-hardware bringup for the DCVG autonomous rover (sensors + Teensy motor bridge + RTK GPS + VIO + EKF + Nav2). dcvg_robot is the simulation counterpart.</description>
   <maintainer email="66011601@kmitl.ac.th">thana</maintainer>
   <license>TODO: License declaration</license>
 
@@ -18,11 +18,28 @@
   <depend>rtabmap_odom</depend>
   <depend>rtabmap_util</depend>
 
-  <!-- Real sensor drivers (installed on the Jetson) -->
+  <!-- Real sensor drivers (installed on the Jetson) — no physical LiDAR in
+       this build (RPLIDAR dropped); obstacle avoidance is depth-camera-only -->
   <exec_depend>realsense2_camera</exec_depend>
-  <exec_depend>rplidar_ros</exec_depend>
-  <exec_depend>mavros</exec_depend>
-  <exec_depend>mavros_extras</exec_depend>
+  <exec_depend>imu_filter_madgwick</exec_depend>
+  <exec_depend>python3-serial</exec_depend>
+
+  <!-- simpleRTK2B Heading (u-blox ZED-F9P) + NTRIP RTK corrections -->
+  <exec_depend>ublox_gps</exec_depend>
+  <exec_depend>ublox_msgs</exec_depend>
+  <exec_depend>ntrip_client</exec_depend>
+  <exec_depend>nmea_msgs</exec_depend>
+  <exec_depend>rtcm_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+
+  <!-- Core ROS deps actually imported by dcvg_bringup's own nodes -->
+  <depend>rclpy</depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>rtabmap_msgs</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>message_filters</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

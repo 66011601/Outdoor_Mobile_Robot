@@ -115,15 +115,20 @@ class RouteWaypointFollower(Node):
         self.navigator = BasicNavigator('basic_navigator')
         self.from_ll_client = self.create_client(FromLL, '/fromLL')
 
-        # Robot position — updated by odometry so we can skip close initial waypoints
+        # Robot position — updated by odometry so we can skip close initial waypoints.
+        # Must be map-frame (ekf_global's output), not odom-frame: it's compared directly
+        # against waypoint poses converted via /fromLL, which are in the map frame too.
+        # odom and map coincide only near startup before drift accumulates — comparing
+        # odom-frame position against map-frame waypoints would skip the wrong waypoints
+        # (or fail to skip ones it should) once they diverge.
         self._robot_x = None
         self._robot_y = None
         self._odom_sub = self.create_subscription(
-            Odometry, '/odometry/local', self._odom_cb, 10)
+            Odometry, '/odometry/global', self._odom_cb, 10)
 
         # Minimum distances (metres) — tunable via ROS parameters
-        self.declare_parameter('min_start_distance', 5.0)
-        self.declare_parameter('min_wp_distance',    2.0)
+        self.declare_parameter('min_start_distance', 1.0)
+        self.declare_parameter('min_wp_distance',    1.0)
         self.min_start_dist: float = float(self.get_parameter('min_start_distance').value)
         self.min_wp_dist:    float = float(self.get_parameter('min_wp_distance').value)
 

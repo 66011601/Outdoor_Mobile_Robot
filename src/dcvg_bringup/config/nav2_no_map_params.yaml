@@ -110,7 +110,7 @@ controller_server:
       # Also matches GPS accuracy (~1-3m) so no real precision is lost.
       xy_goal_tolerance: 1.5
       # Don't require the robot to align heading at each GPS waypoint
-      yaw_goal_tolerance: 3.14
+      yaw_goal_tolerance: 1.57
     # DWB parameters
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
@@ -120,18 +120,18 @@ controller_server:
       # Reduced from 5.2: at 5.2 m/s the 8.84m simulated trajectory extends
       # beyond the 7m (3.5m radius) costmap — obstacles ahead are invisible.
       # At 1.5 m/s: sim_time 1.7s × 1.5 = 2.55m trajectory → fits comfortably.
-      max_vel_x: 1.25
+      max_vel_x: 0.5
       max_vel_y: 0.0
-      max_vel_theta: 1.0
+      max_vel_theta: 0.5
       min_speed_xy: 0.0
-      max_speed_xy: 1.25
+      max_speed_xy: 0.5
       min_speed_theta: 0.0
       acc_lim_x: 1.5
       acc_lim_y: 0.0
-      acc_lim_theta: 2.2
+      acc_lim_theta: 0.8
       decel_lim_x: -2.5
       decel_lim_y: 0.0
-      decel_lim_theta: -3.2
+      decel_lim_theta: -1.0
       vx_samples: 20
       vy_samples: 5
       vtheta_samples: 20
@@ -146,7 +146,7 @@ controller_server:
       critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
       # Raised from 0.02: BaseObstacle penalises proximity to obstacles.
       # At 0.02 vs PathDist 32.0 the robot barely cared about hitting things.
-      BaseObstacle.scale: 0.5
+      BaseObstacle.scale: 2.0
       PathAlign.scale: 32.0
       PathAlign.forward_point_distance: 0.1
       GoalAlign.scale: 24.0
@@ -170,7 +170,7 @@ local_costmap:
       width: 10
       height: 10
       resolution: 0.05
-      robot_radius: 1.00
+      robot_radius: 0.65
       plugins: ["stvl_layer", "denoise_layer", "inflation_layer"]
       stvl_layer:
         plugin: "spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer"
@@ -194,23 +194,13 @@ local_costmap:
         z_voxels: 20               # 20 × 0.05 = 1.0 m height band tracked
         max_obstacle_height: 2.0
         min_obstacle_height: 0.0
-        observation_sources: scan depth_obstacles
-        scan:
-          data_type: LaserScan
-          topic: /lidar/scan
-          marking: true
-          clearing: true
-          obstacle_range: 6.0
-          raytrace_range: 7.0
-          min_obstacle_height: 0.0
-          max_obstacle_height: 2.0
-          inf_is_valid: false
+        observation_sources: depth_obstacles
         depth_obstacles:
           data_type: PointCloud2
           topic: /camera/depth/obstacles
           marking: true
           clearing: true
-          obstacle_range: 3.0
+          obstacle_range: 5.5
           raytrace_range: 4.0
           min_obstacle_height: 0.1
           max_obstacle_height: 2.0
@@ -223,8 +213,8 @@ local_costmap:
         group_connectivity_type: 8 # 8-connected: diagonals count as same cluster
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
-        inflation_radius: 1.5
+        cost_scaling_factor: 2.0
+        inflation_radius: 2.0
       always_send_full_costmap: True
 
 # GPS WPF CHANGE: Remove static layer
@@ -255,19 +245,7 @@ global_costmap:
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
-        observation_sources: scan depth_obstacles
-        scan:
-          topic: /lidar/scan
-          max_obstacle_height: 2.0
-          clearing: True
-          marking: True
-          data_type: "LaserScan"
-          raytrace_max_range: 9.0
-          raytrace_min_range: 0.0
-          obstacle_max_range: 7.0
-          obstacle_min_range: 0.0
-          # outdoors there will probably be more inf points
-          inf_is_valid: false
+        observation_sources: depth_obstacles
         depth_obstacles:
           topic: /camera/depth/obstacles
           min_obstacle_height: 0.1

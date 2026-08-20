@@ -1,0 +1,49 @@
+# ublox_f9p_heading.yaml  (REAL HARDWARE)
+#
+# Config for the HEADING (small) board of the simpleRTK2B Heading kit, over
+# native USB. This board receives moving-base corrections from the position
+# board (config/ublox_f9p.yaml) over the kit's own internal UART link — not
+# from this host — and computes a relative-position vector to the base
+# antenna, published as NAV-RELPOSNED. That vector's heading component is
+# converted to a yaw-only IMU message by gps_heading_to_imu.py and fused into
+# ekf_global as imu1 (see dual_ekf_navsat_params.yaml) — an absolute,
+# driftless yaw source, unlike ekf_local's gyro-only integration.
+#
+# config_on_startup is deliberately false — moving-baseline setup is done
+# once in u-center and left there, same rationale as ublox_f9p.yaml.
+#
+# TBD: verify exact parameter names/values against the installed
+# ros-humble-ublox-gps release once hardware is connected — this is a
+# starting template, not a confirmed-working config.
+ublox_gps_node_heading:
+  ros__parameters:
+    device: /dev/ttyGPS_rover        # overridden by the `heading_device` launch arg
+    frame_id: gps_heading_link
+
+    # Unlike the position board (native USB CDC-ACM on ttyACM0, where baud is
+    # irrelevant), this board is reached over a real UART link through an
+    # FTDI adapter (ttyUSB0, vendor 0403:6015) — baud must match the F9P's
+    # configured UART rate or the driver can't even poll MON-VER on startup.
+    # Confirmed 460800 by probing the port directly (see debug session).
+    # Must be nested under uart1: — the driver reads this as the ROS param
+    # "uart1.baudrate", a flat top-level "baudrate" key is silently ignored.
+    uart1:
+      baudrate: 460800
+
+    config_on_startup: false    # read-only — see note above
+
+    dynamic_model: portable
+    fix_mode: auto
+    dgnss_mode: 3
+    sbas: false
+    enable_ppp: false
+
+    # Only NAV-RELPOSNED is needed from this board right now.
+    publish:
+      all: false
+      nav:
+        pvt: false
+        relposned: true
+
+    inf:
+      all: false

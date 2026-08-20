@@ -3,9 +3,10 @@
   DCVG custom recovery BT (navigate_to_pose).
   Differs from the Nav2 default only in the recovery RoundRobin order:
   the rover BACKS UP before it spins. Spinning in place while wedged against
-  an obstacle the depth camera sees (but the LiDAR misses) scrapes/pivots into
-  it and throws controller errors. Backing away first opens space so the
-  costmap clear + replan can route around the obstacle.
+  an obstacle scrapes/pivots into it and throws controller errors — a bigger
+  risk here since the depth camera (no LiDAR in this build) is the only
+  obstacle sensor and has a blind spot close to the robot. Backing away first
+  opens space so the costmap clear + replan can route around the obstacle.
   Recovery order per stuck event: Clear+replan -> BackUp -> Spin -> Wait.
 -->
 <root main_tree_to_execute="MainTree">
