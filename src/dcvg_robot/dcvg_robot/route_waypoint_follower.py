@@ -26,7 +26,7 @@ import rclpy
 import yaml
 from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped
-from nav2_simple_commander.robot_navigator import BasicNavigator
+from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from robot_localization.srv import FromLL
@@ -139,6 +139,9 @@ class RouteWaypointFollower(Node):
 
         # --- Load stops configuration ---
         self.stops = {}            # {waypoint_index: {index, latitude, longitude}}
+        # Waypoints that finished with a non-SUCCEEDED result. The run continues
+        # past them, so they are survey data gaps and get reported at the end.
+        self._skipped = []         # [(orig_idx, seq, TaskResult)]
         self.confirmation_topic = '/dcvg/stop_confirm'
         self.reached_topic      = '/dcvg/stop_reached'
         self._stop_confirmed    = False
@@ -387,7 +390,25 @@ class RouteWaypointFollower(Node):
                     self.navigator.goToPose(pose)
 
             result = self.navigator.getResult()
-            self.get_logger().info(f"Waypoint {j + 1}/{len(poses)} complete — result: {result}")
+            # A non-SUCCEEDED result here does NOT stop the run — j advances
+            # below regardless, so the rover moves on to the next waypoint. For
+            # a DCVG survey that is a DATA GAP, not a cosmetic issue: the point
+            # was never occupied, so it was never measured. Previously this was
+            # a single info-level line reading "result: TaskResult.FAILED",
+            # indistinguishable at a glance from a success in a scrolling log.
+            if result == TaskResult.SUCCEEDED:
+                self.get_logger().info(
+                    f"Waypoint {j + 1}/{len(poses)} reached — result: {result}")
+            else:
+                wp = self.waypoints[orig_idx]
+                self._skipped.append((orig_idx, j + 1, result))
+                self.get_logger().error(
+                    f"!!! WAYPOINT SKIPPED — DATA GAP !!! "
+                    f"waypoint {j + 1}/{len(poses)} (waypoints.yaml index {orig_idx + 1}) "
+                    f"at lat {float(wp['latitude']):.7f}, lon {float(wp['longitude']):.7f} "
+                    f"was NOT reached (result: {result}). Survey continues to the next "
+                    f"point; this location has no measurement. "
+                    f"Total skipped so far: {len(self._skipped)}")
 
             # --- Stop point: wait for confirmation before advancing ---
             if orig_idx in self.stops:
@@ -399,7 +420,18 @@ class RouteWaypointFollower(Node):
             j += 1
 
         _clear_nav_target()
-        self.get_logger().info("All waypoints reached!")
+        if self._skipped:
+            self.get_logger().error(
+                f"Route finished with {len(self._skipped)} SKIPPED waypoint(s) — "
+                f"the survey has {len(self._skipped)} data gap(s):")
+            for orig_idx, seq, res in self._skipped:
+                wp = self.waypoints[orig_idx]
+                self.get_logger().error(
+                    f"  - waypoint {seq} (waypoints.yaml index {orig_idx + 1}) "
+                    f"lat {float(wp['latitude']):.7f}, lon {float(wp['longitude']):.7f} "
+                    f"({res})")
+        else:
+            self.get_logger().info("All waypoints reached!")
         _write_cmd('stopped')
 
 
