@@ -318,7 +318,20 @@ global_costmap:
       publish_frequency: 1.0
       global_frame: map
       robot_base_frame: base_link
-      robot_radius: 0.65
+      # 0.75 — RAISED from 0.65 to match local_costmap. They disagreed, and the
+      # planner was the permissive one: it planned through gaps the controller's
+      # costmap scored as collision, so RPP would drive up to a "valid" path and
+      # stop. Reconciled UPWARD deliberately, to preserve the obstacle margin
+      # rather than trim the local costmap down to meet the planner.
+      # Geometry check (urdf/dcvg_robot.urdf.xacro): base collision box is
+      # 1.0m x 0.65m, drive wheels centred at y=+-0.4 with 0.122m width, so the
+      # widest extent is +-0.461m. True circumscribed radius for the 1.0 x 0.92m
+      # envelope = sqrt(0.5^2 + 0.461^2) = 0.68m. 0.65 was therefore BELOW the
+      # real chassis radius — geometrically wrong, not just inconsistent.
+      # 0.75 keeps ~0.07m margin over 0.68 for GPS/VIO pose error, which matters
+      # because the rover pivots in place (circumscribed radius is the governing
+      # model during rotation).
+      robot_radius: 0.75
       resolution: 0.1
       # When using GPS navigation you will potentially traverse huge environments which are not practical to
       # fit on a big static costmap. Thus it is recommended to use a rolling global costmap large enough to
