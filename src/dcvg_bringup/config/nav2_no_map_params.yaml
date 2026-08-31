@@ -78,9 +78,22 @@ controller_server:
     min_y_velocity_threshold: 0.5
     min_theta_velocity_threshold: 0.001
     failure_tolerance: 0.3
+    # RPP invariant: rotateToHeading() zeroes linear_vel whenever the carrot is
+    # within xy_goal_tolerance of the robot. odom_topic defaults to "odom", which
+    # nothing in this stack publishes (the EKF publishes odometry/local) — RPP's
+    # rotateToHeading() clamps angular accel against the last *measured* speed, so
+    # a permanently-zero odom reading means rotation never ramps up. DWB never
+    # read odom_topic, so this was latent until the RPP port surfaced it.
+    odom_topic: odometry/local
     progress_checker_plugins: ["progress_checker"]
     goal_checker_plugins: ["general_goal_checker"] # "precise_goal_checker"
-    controller_plugins: ["FollowPath"]
+    # Both plugins are loaded simultaneously for A/B testing (see controller_type
+    # launch arg in bringup.launch.py) — "FollowPath" is the id the custom BT XML
+    # hardcodes (controller_id="FollowPath"), so whichever controller should be
+    # ACTIVE must be the one named "FollowPath" here. RPP is now the default;
+    # the original DWB config is preserved verbatim under "FollowPath_DWB" for
+    # rollback/comparison, selected via a separate BT XML variant.
+    controller_plugins: ["FollowPath", "FollowPath_DWB"]
 
     # Progress checker parameters
     progress_checker:
@@ -104,15 +117,73 @@ controller_server:
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
-      # 1.5m: robot declares "arrived" when within this range.
+      # 1.0m: robot declares "arrived" when within this range.
       # Handles goals placed inside/near obstacles — robot gets close, triggers
       # success, and waypoint follower advances to the next point.
-      # Also matches GPS accuracy (~1-3m) so no real precision is lost.
-      xy_goal_tolerance: 1.5
+      # Lowered from 1.5m to match the simpleRTK2B's actual field behavior: RTK
+      # sits in FLOAT most of the time (~0.2-0.5m, worse on poor sky view) with
+      # FIX (~1-2cm) coming and going — 1.0m keeps real margin over FLOAT-mode
+      # noise without assuming FIX is continuously available. Re-tighten only
+      # after confirming FIX duty cycle in the field (`ros2 topic echo /gps/fix`
+      # covariance / carrier_soln), not from the FIX-mode number alone.
+      xy_goal_tolerance: 1.0
       # Don't require the robot to align heading at each GPS waypoint
       yaw_goal_tolerance: 1.57
-    # DWB parameters
+    # Regulated Pure Pursuit — ACTIVE controller (ported from sim validation).
+    #
+    # HARD INVARIANT: min_lookahead_dist must stay > general_goal_checker's
+    # xy_goal_tolerance (now 1.0m above, tightened from 1.5m — see that comment
+    # for why). If it doesn't, shouldRotateToGoalHeading() believes the carrot is
+    # at/past the goal on every cycle (worse with use_velocity_scaled_lookahead_dist,
+    # which collapses the carrot to min_lookahead_dist while stopped), calls
+    # rotateToHeading() which hard-sets linear_vel=0, and the robot spins in place
+    # forever — a self-sustaining deadlock, not a slow-tuning issue.
+    # min_lookahead_dist is 1.2 (margin over 1.0, same ~20% buffer ratio as the
+    # old 1.6-over-1.5), tightened from 1.6 now that the tolerance dropped —
+    # this is the actual turn-radius lever (turn radius ~= lookahead^2 / (2*y)).
+    # max_lookahead_dist dropped 3.0 -> 2.5 to also keep the carrot closer to
+    # the depth camera's 3.0m obstacle-marking horizon (see local_costmap below).
+    # NOTE: lookahead_dist (static) below is inert at runtime while
+    # use_velocity_scaled_lookahead_dist is true — actual carrot distance is
+    # desired_linear_vel * lookahead_time clamped to [min,max]_lookahead_dist,
+    # i.e. ~1.25*1.5=1.875m at cruise. Kept set for clarity / fallback if
+    # velocity scaling is ever disabled, not because it does anything today.
+    #
+    # inflation_cost_scaling_factor MUST equal the local costmap inflation_layer's
+    # cost_scaling_factor for cost-regulated slowing to read distance-to-obstacle
+    # correctly. That is 4.0 in this file (see local_costmap.inflation_layer
+    # below), not 3.0 — set to 4.0 to match, flagged in the port report.
     FollowPath:
+      plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+      desired_linear_vel: 1.25
+      lookahead_dist: 1.5
+      min_lookahead_dist: 1.2
+      max_lookahead_dist: 2.5
+      lookahead_time: 1.5
+      use_velocity_scaled_lookahead_dist: true
+      transform_tolerance: 0.2
+      min_approach_linear_velocity: 0.05
+      approach_velocity_scaling_dist: 0.6
+      use_collision_detection: true
+      max_allowed_time_to_collision_up_to_carrot: 1.0
+      use_regulated_linear_velocity_scaling: true
+      use_cost_regulated_linear_velocity_scaling: true
+      regulated_linear_scaling_min_radius: 0.9
+      regulated_linear_scaling_min_speed: 0.25
+      inflation_cost_scaling_factor: 4.0
+      cost_scaling_dist: 0.6
+      cost_scaling_gain: 1.0
+      use_rotate_to_heading: true
+      rotate_to_heading_min_angle: 0.785
+      rotate_to_heading_angular_vel: 1.0
+      max_angular_accel: 1.5
+      max_robot_pose_search_dist: 5.0
+      use_interpolation: true
+
+    # DWB parameters — preserved verbatim, still loaded (see controller_plugins
+    # above) so it can be A/B'd against RPP via the controller_type launch arg
+    # without editing this file. NOT the active plugin id ("FollowPath" is).
+    FollowPath_DWB:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: True
       min_vel_x: 0.0
@@ -122,16 +193,16 @@ controller_server:
       # At 1.5 m/s: sim_time 1.7s × 1.5 = 2.55m trajectory → fits comfortably.
       max_vel_x: 0.5
       max_vel_y: 0.0
-      max_vel_theta: 0.5
+      max_vel_theta: 1.0
       min_speed_xy: 0.0
       max_speed_xy: 0.5
       min_speed_theta: 0.0
       acc_lim_x: 1.5
       acc_lim_y: 0.0
-      acc_lim_theta: 0.8
+      acc_lim_theta: 1.5
       decel_lim_x: -2.5
       decel_lim_y: 0.0
-      decel_lim_theta: -1.0
+      decel_lim_theta: -1.5
       vx_samples: 20
       vy_samples: 5
       vtheta_samples: 20
@@ -143,10 +214,16 @@ controller_server:
       trans_stopped_velocity: 0.25
       short_circuit_trajectory_evaluation: True
       stateful: True
-      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
-      # Raised from 0.02: BaseObstacle penalises proximity to obstacles.
-      # At 0.02 vs PathDist 32.0 the robot barely cared about hitting things.
-      BaseObstacle.scale: 2.0
+      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"] # ObstacleFootprint
+      ObstacleFootprint.scale: 3.0
+      # Raised from 0.5: obstacle cost was outvoted by the path-following
+      # critics (PathAlign/PathDist 32.0) roughly 64:1, so DWB shaved past
+      # obstacles instead of swinging around them. NOT the active controller
+      # (RPP/FollowPath is default - see controller_type in bringup.launch.py);
+      # kept correct here for when this is A/B'd via controller_type:=dwb.
+      # If the robot weaves on open ground under that A/B, walk this back
+      # toward 2.0 before touching the path scales.
+      BaseObstacle.scale: 5.0
       PathAlign.scale: 32.0
       PathAlign.forward_point_distance: 0.1
       GoalAlign.scale: 24.0
@@ -162,7 +239,9 @@ local_costmap:
   local_costmap:
     ros__parameters:
       use_sim_time: False
-      update_frequency: 10.0
+      # Matched to controller_frequency (20.0): /camera/depth/obstacles measured
+      # ~29 Hz on hardware, so the sensor isn't the limiter here.
+      update_frequency: 20.0
       publish_frequency: 2.0
       global_frame: odom
       robot_base_frame: base_link
@@ -170,7 +249,7 @@ local_costmap:
       width: 10
       height: 10
       resolution: 0.05
-      robot_radius: 0.65
+      robot_radius: 0.75
       plugins: ["stvl_layer", "denoise_layer", "inflation_layer"]
       stvl_layer:
         plugin: "spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer"
@@ -181,7 +260,7 @@ local_costmap:
         # Increased from 3.0: exponential decay at 3s fades obstacles in ~9s.
         # A slow robot can take longer than that to clear an obstacle, making
         # it disappear as "free" before the robot has actually passed.
-        voxel_decay: 2.0
+        voxel_decay: 10.0
         decay_model: 0             # 0=linear — predictable, easier to reason about
         voxel_size: 0.05           # matches costmap resolution
         track_unknown_space: true
@@ -200,7 +279,7 @@ local_costmap:
           topic: /camera/depth/obstacles
           marking: true
           clearing: true
-          obstacle_range: 5.5
+          obstacle_range: 3.0
           raytrace_range: 4.0
           min_obstacle_height: 0.1
           max_obstacle_height: 2.0
@@ -213,7 +292,14 @@ local_costmap:
         group_connectivity_type: 8 # 8-connected: diagonals count as same cluster
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 2.0
+        cost_scaling_factor: 4.0
+        # Widened from 1.0. robot_radius above is 0.75, so 1.0 left only 0.25m
+        # of cost gradient outside the inscribed circle - RPP's cost-regulated
+        # slowing (FollowPath.cost_scaling_dist: 0.6 below) barely had room to
+        # see an obstacle before the robot was already on top of it. 2.0 gives
+        # 1.25m of gradient, comfortably past cost_scaling_dist.
+        # inflation_cost_scaling_factor in FollowPath (RPP) must keep matching
+        # cost_scaling_factor above (both 4.0) - unaffected by this radius change.
         inflation_radius: 2.0
       always_send_full_costmap: True
 
@@ -223,7 +309,12 @@ global_costmap:
   global_costmap:
     ros__parameters:
       use_sim_time: False
-      update_frequency: 1.0
+      # Raised from 1.0 - was the slowest stage in the replan chain. This is
+      # the expensive one (100x100 @ 0.1m = 1M cells); re-check planner_server
+      # CPU after. If it starts missing cycles, shrink width/height before
+      # reverting this rate (a rolling global costmap only needs to span the
+      # current pair of successive GPS waypoints).
+      update_frequency: 3.0
       publish_frequency: 1.0
       global_frame: map
       robot_base_frame: base_link
@@ -253,15 +344,15 @@ global_costmap:
           clearing: True
           marking: True
           data_type: "PointCloud2"
-          raytrace_max_range: 10.0
+          raytrace_max_range: 6.0
           raytrace_min_range: 0.0
-          obstacle_max_range: 10.0
+          obstacle_max_range: 5.5
           obstacle_min_range: 0.6
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         # faster drop-off keeps inflation tight around actual obstacles
-        cost_scaling_factor: 3.0
-        inflation_radius: 2.0
+        cost_scaling_factor: 4.0
+        inflation_radius: 1.0
       always_send_full_costmap: True
 
 # The yaml_filename does not need to be specified since it going to be set by defaults in launch.
@@ -345,10 +436,15 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [1.5, 0.0, 1.0]
-    min_velocity: [-1.5, 0.0, -1.0]
+    max_velocity: [1.5, 0.0, 1.5]
+    min_velocity: [-1.5, 0.0, -1.5]
     max_accel: [2.5, 0.0, 3.2]
-    max_decel: [-2.5, 0.0, -3.2]
+    # Raised from -2.5/-3.2 (stopping distance ~0.45m -> ~0.33m at 1.5 m/s).
+    # DWB's decel_lim_x is -5.0, so the smoother, not the controller, was the
+    # bottleneck on an emergency stop. Stepped to -3.0/-3.6 rather than the
+    # full -4.0/-4.5 target - verify the drivetrain accepts this without
+    # skidding/faulting at low speed, kill-switch in hand, before going further.
+    max_decel: [-3.0, 0.0, -3.6]
     odom_topic: "odometry/local"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
@@ -370,7 +466,7 @@ route_server:
     num_nearest_nodes: 4
     max_nn_search_iterations: 1000
     max_planning_time: 2.0
-    max_prune_dist_from_edge: 5.0
+    max_prune_dist_from_edge: 1.5
     min_prune_dist_from_start: 0.5
     min_prune_dist_from_goal: 0.5
     # Edge cost functions (distance only for this simple demo)

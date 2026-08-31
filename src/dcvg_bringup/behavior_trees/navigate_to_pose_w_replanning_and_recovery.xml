@@ -13,7 +13,9 @@
   <BehaviorTree ID="MainTree">
     <RecoveryNode number_of_retries="6" name="NavigateRecovery">
       <PipelineSequence name="NavigateWithReplanning">
-        <RateController hz="1.0">
+        <!-- Raised from 1.0 Hz (each tick costs one NavFn solve over the
+             global costmap; re-check planner_server CPU after changing). -->
+        <RateController hz="2.0">
           <RecoveryNode number_of_retries="1" name="ComputePathToPose">
             <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
             <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>

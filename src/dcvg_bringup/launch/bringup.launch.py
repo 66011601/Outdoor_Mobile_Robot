@@ -45,6 +45,7 @@ if a device ever needs a one-off different path.
 Usage:
   ros2 launch dcvg_bringup bringup.launch.py
   ros2 launch dcvg_bringup bringup.launch.py use_stereo:=true use_rviz:=True
+  ros2 launch dcvg_bringup bringup.launch.py controller_type:=dwb   # A/B vs RPP (default)
 """
 
 import os
@@ -54,7 +55,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import Command, LaunchConfiguration
+from launch.substitutions import Command, LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from nav2_common.launch import RewrittenYaml
@@ -72,17 +73,30 @@ def generate_launch_description():
     use_stereo   = LaunchConfiguration('use_stereo')
     use_rviz     = LaunchConfiguration('use_rviz')
     description_file = LaunchConfiguration('description_file')
+    controller_type = LaunchConfiguration('controller_type')
+    is_rpp = PythonExpression(["'", controller_type, "' == 'rpp'"])
+    is_dwb = PythonExpression(["'", controller_type, "' == 'dwb'"])
 
     # Point bt_navigator at the custom recovery BTs (BackUp before Spin).
-    param_substitutions = {
-        'default_nav_to_pose_bt_xml': os.path.join(
-            bt_dir, 'navigate_to_pose_w_replanning_and_recovery.xml'),
-        'default_nav_through_poses_bt_xml': os.path.join(
-            bt_dir, 'navigate_through_poses_w_replanning_and_recovery.xml'),
-    }
-    configured_params = RewrittenYaml(
+    # Two variants per BT, differing only in which controller_id the FollowPath
+    # BT node targets — "FollowPath" (RPP, the active plugin id in
+    # nav2_no_map_params.yaml) or "FollowPath_DWB" (the archived DWB config,
+    # still loaded alongside it) — selected by controller_type below so DWB vs
+    # RPP can be A/B tested on hardware without hand-editing the yaml.
+    def bt_param_substitutions(suffix):
+        return {
+            'default_nav_to_pose_bt_xml': os.path.join(
+                bt_dir, f'navigate_to_pose_w_replanning_and_recovery{suffix}.xml'),
+            'default_nav_through_poses_bt_xml': os.path.join(
+                bt_dir, f'navigate_through_poses_w_replanning_and_recovery{suffix}.xml'),
+        }
+    configured_params_rpp = RewrittenYaml(
         source_file=nav2_params, root_key='',
-        param_rewrites=param_substitutions, convert_types=True,
+        param_rewrites=bt_param_substitutions(''), convert_types=True,
+    )
+    configured_params_dwb = RewrittenYaml(
+        source_file=nav2_params, root_key='',
+        param_rewrites=bt_param_substitutions('_dwb'), convert_types=True,
     )
 
     robot_description = ParameterValue(
@@ -92,6 +106,12 @@ def generate_launch_description():
         DeclareLaunchArgument('use_sim_time', default_value='False'),
         DeclareLaunchArgument('use_stereo',   default_value='True'),
         DeclareLaunchArgument('use_rviz',     default_value='False'),
+        DeclareLaunchArgument('controller_type', default_value='rpp',
+            description='Controller for FollowPath A/B testing: "rpp" (default — '
+                        'Regulated Pure Pursuit, ported from sim) or "dwb" (original '
+                        'DWB, still loaded as FollowPath_DWB in nav2_no_map_params.yaml). '
+                        'Selects between BT XML variants that differ only in which '
+                        'controller_id the FollowPath action targets.'),
         DeclareLaunchArgument('teensy_port',  default_value='/dev/ttyTeensy',
             description='Teensy serial device for low_level_command'),
         DeclareLaunchArgument('gps_device',   default_value='/dev/ttyGPS_movingbase',
@@ -207,9 +227,23 @@ def generate_launch_description():
                     os.path.join(bringup_dir, 'launch', 'navigation_launch.py')),
                 launch_arguments={
                     'use_sim_time': use_sim_time,
-                    'params_file': configured_params,
+                    'params_file': configured_params_rpp,
                     'autostart': 'True',
                 }.items(),
+                condition=IfCondition(is_rpp),
+            )],
+        ),
+        TimerAction(
+            period=LaunchConfiguration('nav2_delay'),
+            actions=[IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(bringup_dir, 'launch', 'navigation_launch.py')),
+                launch_arguments={
+                    'use_sim_time': use_sim_time,
+                    'params_file': configured_params_dwb,
+                    'autostart': 'True',
+                }.items(),
+                condition=IfCondition(is_dwb),
             )],
         ),
 

@@ -10,7 +10,10 @@
   <BehaviorTree ID="MainTree">
     <RecoveryNode number_of_retries="6" name="NavigateRecovery">
       <PipelineSequence name="NavigateWithReplanning">
-        <RateController hz="0.333">
+        <!-- Raised from 0.333 Hz (every 3s - at 1.5 m/s the robot traveled
+             4.5m on a stale route before even considering a replan). Each
+             tick costs one NavFn solve over the global costmap. -->
+        <RateController hz="1.5">
           <RecoveryNode number_of_retries="1" name="ComputePathThroughPoses">
             <ReactiveSequence>
               <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="0.7"/>
