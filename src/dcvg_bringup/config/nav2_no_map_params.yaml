@@ -214,7 +214,19 @@ controller_server:
       trans_stopped_velocity: 0.25
       short_circuit_trajectory_evaluation: True
       stateful: True
-      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"] # ObstacleFootprint
+      # ObstacleFootprint ACTIVATED (was commented out of this list while
+      # ObstacleFootprint.scale sat below it looking live — the scale was dead
+      # config). This extends the field finding in the BaseObstacle comment
+      # below rather than contradicting it: BaseObstacle scores only the single
+      # cell under the robot's centre, so it can flag "my centre is on an
+      # obstacle" but never "my body is clipping one". That is why DWB shaved
+      # past obstacles, and why no BaseObstacle.scale value alone could fix it —
+      # 5.0 raises the volume on a critic that is not measuring the body.
+      # ObstacleFootprint scores the whole footprint (robot_radius 0.75) and is
+      # the critic that actually rejects clipping trajectories.
+      # NOT field-tested — DWB stays inactive; this repairs the rollback path so
+      # controller_type:=dwb is honest rather than silently footprint-blind.
+      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "ObstacleFootprint", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
       ObstacleFootprint.scale: 3.0
       # Raised from 0.5: obstacle cost was outvoted by the path-following
       # critics (PathAlign/PathDist 32.0) roughly 64:1, so DWB shaved past
