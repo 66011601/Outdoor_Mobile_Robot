@@ -339,11 +339,39 @@ class RouteWaypointFollower(Node):
         self.get_logger().info(
             f"Starting navigation: {len(poses)} waypoints, {len(self.stops)} stop(s)")
 
-        j = 0
-        while j < len(poses):
-            orig_idx, pose = poses[j]
+        # ── Split the route into SEGMENTS ────────────────────────────────────
+        # The route's ~1m points define path SHAPE, not places to stop. Sending
+        # one NavigateToPose per point made every point a terminal goal — goal
+        # checker, full stop, replan, restart — which is what made the motion
+        # stop-start and zigzaggy between closely-spaced waypoints.
+        # Instead, each segment is handed to Nav2 as ONE NavigateThroughPoses
+        # plan, so the planner produces a single continuous path and the
+        # controller flows through the intermediate points without ever
+        # goal-checking at them. A segment ends only where the rover genuinely
+        # must stop: a DCVG measurement stop, or the end of the route.
+        # How close the rover passes each intermediate point is now governed by
+        # RemovePassedGoals radius="0.7" in the navigate_through_poses BT — NOT
+        # by xy_goal_tolerance, which now applies only at segment ends.
+        segments = []          # [[(orig_idx, pose), ...], ...]
+        current = []
+        for entry in poses:
+            current.append(entry)
+            if entry[0] in self.stops:      # stop terminates the segment
+                segments.append(current)
+                current = []
+        if current:
+            segments.append(current)
 
-            # --- Check command before each waypoint ---
+        self.get_logger().info(
+            f"Route split into {len(segments)} continuous segment(s) "
+            f"({len(poses)} waypoints, {len(self.stops)} stop(s))")
+
+        for seg_no, segment in enumerate(segments, start=1):
+            seg_poses = [p for _, p in segment]
+            end_orig_idx = segment[-1][0]
+            ends_at_stop = end_orig_idx in self.stops
+
+            # --- Check command before starting the segment ---
             while True:
                 cmd = _read_cmd()
                 if cmd == 'stop':
@@ -355,16 +383,18 @@ class RouteWaypointFollower(Node):
                     continue
                 break
 
-            self.get_logger().info(f"→ Waypoint {j + 1}/{len(poses)}"
-                                   + (" [STOP ahead]" if orig_idx in self.stops else ""))
-            # Publish the current target so the web app can highlight it.
-            # orig_idx maps to the same waypoints.yaml the app loaded.
-            twp = self.waypoints[orig_idx]
-            _write_nav_target(orig_idx, j + 1, len(poses),
-                              float(twp['latitude']), float(twp['longitude']))
-            self.navigator.goToPose(pose)
+            self.get_logger().info(
+                f"→ Segment {seg_no}/{len(segments)}: {len(seg_poses)} pose(s) "
+                f"flowing through to waypoint index {end_orig_idx + 1}"
+                + (" [STOP at end]" if ends_at_stop else ""))
 
-            # --- Monitor until waypoint reached or command received ---
+            # Publish the segment's end as the web app's highlighted target.
+            twp = self.waypoints[end_orig_idx]
+            _write_nav_target(end_orig_idx, seg_no, len(segments),
+                              float(twp['latitude']), float(twp['longitude']))
+            self.navigator.goThroughPoses(seg_poses)
+
+            # --- Monitor until segment complete or command received ---
             while not self.navigator.isTaskComplete():
                 rclpy.spin_once(self, timeout_sec=0.05)
                 cmd = _read_cmd()
@@ -377,7 +407,7 @@ class RouteWaypointFollower(Node):
 
                 if cmd == 'pause':
                     self.navigator.cancelTask()
-                    self.get_logger().info(f"Paused at waypoint {j + 1}")
+                    self.get_logger().info(f"Paused during segment {seg_no}")
                     cmd = 'pause'
                     while cmd == 'pause':
                         rclpy.spin_once(self, timeout_sec=0.2)
@@ -386,38 +416,41 @@ class RouteWaypointFollower(Node):
                         _clear_nav_target()
                         self.get_logger().info("Navigation stopped while paused.")
                         return
-                    self.get_logger().info(f"Resumed — re-navigating to waypoint {j + 1}")
-                    self.navigator.goToPose(pose)
+                    # Re-issue the WHOLE segment: RemovePassedGoals in the BT
+                    # prunes the poses already behind the rover, so replaying
+                    # the full list resumes correctly without tracking progress.
+                    self.get_logger().info(f"Resumed — re-issuing segment {seg_no}")
+                    self.navigator.goThroughPoses(seg_poses)
 
             result = self.navigator.getResult()
-            # A non-SUCCEEDED result here does NOT stop the run — j advances
-            # below regardless, so the rover moves on to the next waypoint. For
-            # a DCVG survey that is a DATA GAP, not a cosmetic issue: the point
-            # was never occupied, so it was never measured. Previously this was
-            # a single info-level line reading "result: TaskResult.FAILED",
-            # indistinguishable at a glance from a success in a scrolling log.
+            # A non-SUCCEEDED result does NOT stop the run — the survey advances
+            # to the next segment. With through-poses a failure can strand EVERY
+            # point in the segment, so all of them are recorded as data gaps
+            # rather than just one.
             if result == TaskResult.SUCCEEDED:
                 self.get_logger().info(
-                    f"Waypoint {j + 1}/{len(poses)} reached — result: {result}")
+                    f"Segment {seg_no}/{len(segments)} complete — result: {result}")
             else:
-                wp = self.waypoints[orig_idx]
-                self._skipped.append((orig_idx, j + 1, result))
+                for orig_idx, _ in segment:
+                    self._skipped.append((orig_idx, seg_no, result))
+                first_wp = self.waypoints[segment[0][0]]
+                last_wp = self.waypoints[end_orig_idx]
                 self.get_logger().error(
-                    f"!!! WAYPOINT SKIPPED — DATA GAP !!! "
-                    f"waypoint {j + 1}/{len(poses)} (waypoints.yaml index {orig_idx + 1}) "
-                    f"at lat {float(wp['latitude']):.7f}, lon {float(wp['longitude']):.7f} "
-                    f"was NOT reached (result: {result}). Survey continues to the next "
-                    f"point; this location has no measurement. "
+                    f"!!! SEGMENT FAILED — DATA GAP !!! "
+                    f"segment {seg_no}/{len(segments)} covering waypoints.yaml indices "
+                    f"{segment[0][0] + 1}..{end_orig_idx + 1} "
+                    f"(lat {float(first_wp['latitude']):.7f}, lon {float(first_wp['longitude']):.7f}"
+                    f" → lat {float(last_wp['latitude']):.7f}, lon {float(last_wp['longitude']):.7f}) "
+                    f"was NOT completed (result: {result}). Survey continues to the next "
+                    f"segment; {len(segment)} location(s) have no measurement. "
                     f"Total skipped so far: {len(self._skipped)}")
 
-            # --- Stop point: wait for confirmation before advancing ---
-            if orig_idx in self.stops:
-                outcome = self._wait_at_stop(orig_idx)
+            # --- Stop point: wait for confirmation before the next segment ---
+            if ends_at_stop:
+                outcome = self._wait_at_stop(end_orig_idx)
                 if outcome == 'stop':
                     _clear_nav_target()
                     return
-
-            j += 1
 
         _clear_nav_target()
         if self._skipped:
