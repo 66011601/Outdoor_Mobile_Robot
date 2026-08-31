@@ -386,7 +386,17 @@ map_saver:
 planner_server:
   ros__parameters:
     use_sim_time: False
-    expected_planner_frequency: 20.0
+    # 2.0, not 20.0. This value only drives a warning: planner_server warns
+    # "Planner loop missed its desired rate" whenever a solve exceeds
+    # 1/expected_planner_frequency. At 20.0 that budget was 50ms, and NavFn over
+    # this global costmap (100x100m at 0.1m = 1000x1000 cells) does not reliably
+    # solve in 50ms on the Orin Nano while VIO and RTK compete for cores — so it
+    # warned constantly and the log stopped being a useful signal.
+    # Nothing actually asks for 20Hz: replanning is driven by the BT's
+    # RateController, which is 2.0Hz in navigate_to_pose and 1.5Hz in
+    # navigate_through_poses. 2.0 is the honest ceiling, so a warning now means
+    # a genuinely slow solve rather than a misconfigured expectation.
+    expected_planner_frequency: 2.0
     planner_plugins: ["GridBased"]
     GridBased:
       plugin: "nav2_navfn_planner/NavfnPlanner"
