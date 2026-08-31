@@ -17,7 +17,23 @@
              global costmap; re-check planner_server CPU after changing). -->
         <RateController hz="2.0">
           <RecoveryNode number_of_retries="1" name="ComputePathToPose">
-            <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+            <!-- SmoothPath runs between planning and following. smoother_server
+                 and simple_smoother were configured, and
+                 nav2_smooth_path_action_bt_node was in plugin_lib_names, but
+                 nothing ever called the action — the smoother was dead weight.
+                 NavFn is 8-connected on a 0.1m grid, so its raw output has 45-deg
+                 staircase steps; RPP steers at whatever the path hands it, so
+                 those steps become curvature chatter.
+                 Failure here is non-fatal by design: the Sequence is wrapped so
+                 that if smoothing fails we fall through to the UNSMOOTHED path
+                 rather than losing the plan and triggering recovery. -->
+            <Sequence name="PlanThenSmooth">
+              <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+              <Fallback name="SmoothOrPassThrough">
+                <SmoothPath unsmoothed_path="{path}" smoothed_path="{path}" smoother_id="simple_smoother"/>
+                <AlwaysSuccess/>
+              </Fallback>
+            </Sequence>
             <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
           </RecoveryNode>
         </RateController>

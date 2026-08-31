@@ -15,9 +15,17 @@
              tick costs one NavFn solve over the global costmap. -->
         <RateController hz="1.5">
           <RecoveryNode number_of_retries="1" name="ComputePathThroughPoses">
+            <!-- SmoothPath added after planning — see the navigate_to_pose
+                 variant for the rationale. Wrapped in a Fallback so a smoothing
+                 failure falls through to the unsmoothed path instead of
+                 dropping the plan and triggering recovery. -->
             <ReactiveSequence>
               <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="0.7"/>
               <ComputePathThroughPoses goals="{goals}" path="{path}" planner_id="GridBased"/>
+              <Fallback name="SmoothOrPassThrough">
+                <SmoothPath unsmoothed_path="{path}" smoothed_path="{path}" smoother_id="simple_smoother"/>
+                <AlwaysSuccess/>
+              </Fallback>
             </ReactiveSequence>
             <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
           </RecoveryNode>
