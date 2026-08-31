@@ -128,7 +128,15 @@ class RouteWaypointFollower(Node):
 
         # Minimum distances (metres) — tunable via ROS parameters
         self.declare_parameter('min_start_distance', 1.0)
-        self.declare_parameter('min_wp_distance',    1.0)
+        # 0.3, not 1.0. The live route is spaced a uniform 0.99m, so a 1.0
+        # threshold sat directly ON the spacing: whether a point survived came
+        # down to float noise in the fromLL projection, dropping points
+        # nondeterministically and making runs inconsistent between attempts.
+        # This matters more now that the points are fed as NavigateThroughPoses
+        # path shape rather than individual goals — dropping half of them
+        # coarsens the path the planner is asked to follow. 0.3 keeps every real
+        # ~1m point while still collapsing true duplicates.
+        self.declare_parameter('min_wp_distance',    0.3)
         self.min_start_dist: float = float(self.get_parameter('min_start_distance').value)
         self.min_wp_dist:    float = float(self.get_parameter('min_wp_distance').value)
 
