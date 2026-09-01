@@ -155,7 +155,19 @@ controller_server:
     # below), not 3.0 — set to 4.0 to match, flagged in the port report.
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
-      desired_linear_vel: 1.25
+      # 0.5, REDUCED from 1.25 pending a valid stop-latency measurement.
+      # Field-observed actuation dead time is order several hundred ms (the
+      # exact figure is not yet known — the first probe's onset detector was
+      # broken, see latency_probe.py, so no number from it can be used).
+      # Blind travel after a stop command = speed * (dead + decel time):
+      #   at 1.25 m/s, 600ms of dead time alone is 0.75m of travel before the
+      #   command has any effect at all, before deceleration even begins.
+      # RPP's max_allowed_time_to_collision_up_to_carrot is 1.0s below, so the
+      # controller assumes it can stop within 1s of travel — an assumption that
+      # is simply false with this much dead time, and the depth camera only
+      # marks obstacles to 3.0m. Restore this only when measured stop latency
+      # shows the assumption holds.
+      desired_linear_vel: 0.5
       lookahead_dist: 1.5
       min_lookahead_dist: 1.2
       max_lookahead_dist: 2.5
