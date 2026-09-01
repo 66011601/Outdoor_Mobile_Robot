@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'low_level_command = dcvg_bringup.low_level_command:main',
             'latency_probe = dcvg_bringup.latency_probe:main',
+            'path_tracking_logger = dcvg_bringup.path_tracking_logger:main',
             'ntrip_bridge = dcvg_bringup.ntrip_bridge:main',
             'gps_heading_to_imu = dcvg_bringup.gps_heading_to_imu:main',
             'imu_throttle = dcvg_bringup.imu_throttle:main',
