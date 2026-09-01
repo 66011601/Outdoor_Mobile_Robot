@@ -138,9 +138,21 @@ controller_server:
     # which collapses the carrot to min_lookahead_dist while stopped), calls
     # rotateToHeading() which hard-sets linear_vel=0, and the robot spins in place
     # forever — a self-sustaining deadlock, not a slow-tuning issue.
-    # min_lookahead_dist is 1.2 (margin over 1.0, same ~20% buffer ratio as the
-    # old 1.6-over-1.5), tightened from 1.6 now that the tolerance dropped —
-    # this is the actual turn-radius lever (turn radius ~= lookahead^2 / (2*y)).
+    # min_lookahead_dist RAISED 1.2 -> 1.5. This CONTRADICTS the earlier comment
+    # here, which tightened it 1.6 -> 1.2 to sharpen turns; that reasoning is
+    # superseded and the justification is that the goal has inverted. Tight
+    # turning was the objective then; hard recovery turns are the complaint now.
+    # Curvature is kappa = 2y/L^2, so aggressiveness falls with the SQUARE of
+    # lookahead: 1.2 -> 1.5 cuts commanded curvature for a given lateral offset
+    # by (1.2/1.5)^2 = 0.64, a 36% softer recovery turn.
+    # This matters most at the test speed, not at cruise: with
+    # use_velocity_scaled_lookahead_dist the carrot is speed*lookahead_time, so
+    # at 0.3 m/s that is 0.3*1.5 = 0.45m, far below the floor — low-speed
+    # testing runs PINNED at min_lookahead_dist, i.e. at the most aggressive
+    # setting the config allows. Raising the floor is therefore the only lever
+    # that changes low-speed behaviour at all.
+    # Also moves AWAY from the deadlock cliff (1.5 vs xy_goal_tolerance 1.0),
+    # rather than toward it.
     # max_lookahead_dist dropped 3.0 -> 2.5 to also keep the carrot closer to
     # the depth camera's 3.0m obstacle-marking horizon (see local_costmap below).
     # NOTE: lookahead_dist (static) below is inert at runtime while
@@ -169,7 +181,7 @@ controller_server:
       # shows the assumption holds.
       desired_linear_vel: 0.5
       lookahead_dist: 1.5
-      min_lookahead_dist: 1.2
+      min_lookahead_dist: 1.5
       max_lookahead_dist: 2.5
       lookahead_time: 1.5
       use_velocity_scaled_lookahead_dist: true
