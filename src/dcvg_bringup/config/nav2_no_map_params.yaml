@@ -198,7 +198,28 @@ controller_server:
       cost_scaling_dist: 0.6
       cost_scaling_gain: 1.0
       use_rotate_to_heading: true
-      rotate_to_heading_min_angle: 0.785
+      # RAISED 0.785 (45 deg) -> 1.0 (57 deg). This threshold does two things at
+      # once, and BOTH move the right way when raised, given the stated
+      # acceptance criterion of "roughly aligned", not "precisely aligned":
+      #
+      #  1. It gates WHEN an in-place pivot starts. RPP zeroes linear velocity
+      #     and pivots whenever the angle to the carrot exceeds this. Every such
+      #     pivot is a full stop, and every restart costs ~600ms of mechanical
+      #     breakaway. Raising the gate means moderate misalignments are arced
+      #     out while still moving, instead of paying a stop.
+      #  2. It gates WHEN the pivot ENDS — rotation continues only while the
+      #     angle exceeds the threshold. So a higher value also stops the pivot
+      #     SOONER, leaving the robot roughly rather than precisely aligned.
+      #     That is the requested behaviour, not a compromise.
+      #
+      # Deliberately NOT raised further. Past ~90 deg the carrot sits behind the
+      # robot, where forward-only curvature cannot represent the correction and
+      # RPP would swing out in a wide loop instead. 57 deg keeps a real pivot
+      # available for the genuinely large misalignment at route start — which is
+      # exactly the "align before moving off" case that SHOULD pivot.
+      # Unrelated to the rotateToHeading deadlock invariant, which is governed by
+      # min_lookahead_dist vs xy_goal_tolerance, not by this angle.
+      rotate_to_heading_min_angle: 1.0
       rotate_to_heading_angular_vel: 1.0
       max_angular_accel: 1.5
       max_robot_pose_search_dist: 5.0
