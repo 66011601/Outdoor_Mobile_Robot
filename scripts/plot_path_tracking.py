@@ -13,7 +13,7 @@ PANELS
   1  cross-track error vs time, with path-change markers
        continuous oscillation      -> RPP geometry / lookahead too short
        steps at costmap resolution -> jagged NavFn path
-       steady one-sided bias on curves -> open-loop track slip
+       steady one-sided bias on curves -> track-vs-ground slip
   2  commanded omega vs time, plus omega shifted by the actuation lag
        spikes at fixed spacing     -> waypoint dispatch
   3  omega vs cross-track error, coloured by time
@@ -25,9 +25,11 @@ PANELS
        a sharp peak at the waypoint spacing is the dispatch signature; a broad
        peak at a shorter wavelength is the pursuit limit cycle
 
-The lag shift matters: with ~600ms of mechanical breakaway and no encoders, an
-omega command and the cross-track error at the SAME timestamp are not cause and
-effect. Panel 2 draws both so the correlation is read against the shifted trace.
+The lag shift matters: the Teensy PID tracks commanded velocity at the sprocket,
+but ~600ms of MECHANICAL breakaway sits in front of it and no feedback reaches
+the Jetson, so an omega command and the cross-track error at the SAME timestamp
+are not cause and effect. Panel 2 draws both traces so the correlation is read
+against the shifted one.
 """
 
 import argparse
@@ -121,8 +123,8 @@ def main():
     ax1.set_ylabel('XTE [m]  (+ = left)')
     ax1.grid(alpha=0.3)
     if abs(bias) > 0.5 * rms and rms > 0.05:
-        ax1.text(0.01, 0.05, 'one-sided bias -> suspect open-loop track slip '
-                             '(not fixable in software)',
+        ax1.text(0.01, 0.05, 'one-sided bias -> suspect track-vs-ground slip '
+                             '(sprocket PID cannot see it; not a tuning problem)',
                  transform=ax1.transAxes, color='darkred', fontsize=9)
 
     # 2 — commanded omega, raw and lag-shifted
@@ -134,7 +136,7 @@ def main():
         ax2.plot(t[shift:], wz[:-shift] if shift else wz, lw=0.9, alpha=0.65,
                  color='tab:green', label=f'cmd omega +{a.lag:.2f}s lag')
     ax2.plot(t, vx, lw=0.9, color='tab:gray', alpha=0.7, label='cmd vx')
-    ax2.set_title('2. commanded velocity (NOT achieved — open loop)')
+    ax2.set_title('2. commanded velocity (tracked at sprocket; ~600ms mech. lag)')
     ax2.set_xlabel('t [s]')
     ax2.set_ylabel('omega [rad/s] / vx [m/s]')
     ax2.legend(fontsize=8)

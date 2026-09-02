@@ -19,9 +19,12 @@ WHAT THE SIGNATURES MEAN (this is the point of the tool)
       -> RPP GEOMETRY. Lookahead too short for the speed; kappa = 2y/L^2 so
          the correction overshoots and re-corrects.
   steady one-sided cross-track bias that appears only on curves
-      -> OPEN-LOOP SLIP. Commanded velocity is not achieved; the tracks slip.
-         Not fixable in software on this platform (no encoders — the Teensy is
-         write-only), so this one is a "stop tuning" signal, not a bug.
+      -> TRACK-vs-GROUND SLIP. Still a "stop tuning" signal, but be precise
+         about why: the Teensy runs a closed-loop velocity PID on its own
+         encoders, so commanded velocity IS achieved AT THE SPROCKET. What that
+         loop cannot see is the track slipping against dirt, which is exactly
+         what a skid-steer chassis does in a turn. So this is not a control
+         problem to tune out, and no lookahead value fixes it.
   staircase in cross_track_error with steps at the costmap resolution
       -> JAGGED GLOBAL PATH. NavFn 8-connected on a 0.1m grid.
 
@@ -35,12 +38,13 @@ current global path (not the nearest vertex — vertex distance quantizes to the
 path resolution and would manufacture a staircase that isn't there). Positive is
 left of the path direction.
 
-NOTE ON CAUSALITY: /cmd_vel is what Nav2 asked for, not what the tracks did.
-This platform has ~600ms of mechanical breakaway and no encoder feedback, so
-commanded and actual diverge. Cross-track error is the RESPONSE to commands
-issued ~600ms earlier — do not read a command and an error at the same timestamp
-as cause and effect. The plotter draws a shifted-command trace to make this
-visible.
+NOTE ON CAUSALITY: /cmd_vel is what Nav2 asked for. The Teensy's velocity PID
+does track it at the sprocket, but there is still ~600ms of MECHANICAL breakaway
+on start-from-rest (confirmed under RC control, which bypasses all software), and
+that feedback is not transmitted back to the Jetson, so nothing here observes it.
+Cross-track error is therefore the RESPONSE to commands issued ~600ms earlier —
+do not read a command and an error at the same timestamp as cause and effect. The
+plotter draws a shifted-command trace to make this visible.
 
 Usage
 ─────
@@ -139,7 +143,8 @@ class PathTrackingLogger(Node):
         self.get_logger().info(
             f'logging -> {self.out_path}   (paths -> {self.paths_path})')
         self.get_logger().info(
-            'NOTE: cmd_vel is COMMANDED, not achieved — open-loop, no encoders.')
+            'NOTE: cmd_vel is COMMANDED. The Teensy PID tracks it at the '
+            'sprocket, but that feedback never reaches this node.')
 
     # ── inputs ──────────────────────────────────────────────────────────────
     def _on_path(self, msg: Path):
