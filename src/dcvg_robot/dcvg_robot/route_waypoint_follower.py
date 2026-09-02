@@ -210,6 +210,40 @@ class RouteWaypointFollower(Node):
         pose.pose.orientation = quaternion_from_euler(0.0, 0.0, yaw)
         return pose
 
+    def _poses_ahead(self, seg_poses):
+        """Return the tail of seg_poses starting at the pose nearest the rover.
+
+        Used when re-issuing a segment after a pause. RemovePassedGoals in the BT
+        only prunes goals it is already close to, so anything left in front of the
+        list that the rover has driven past would be navigated back to. Trimming
+        by nearest-pose is enough here because a segment is a single forward run
+        along the route — there is no branching to disambiguate.
+
+        Falls back to the full segment if no pose estimate is available, since
+        re-driving the segment is recoverable whereas sending an empty goal list
+        is not.
+        """
+        for _ in range(20):
+            rclpy.spin_once(self, timeout_sec=0.05)
+            if self._robot_x is not None:
+                break
+        if self._robot_x is None:
+            self.get_logger().warn(
+                'No pose available on resume — re-issuing the full segment. '
+                'The rover may drive back toward its start.')
+            return seg_poses
+
+        rx, ry = float(self._robot_x), float(self._robot_y)
+        nearest = min(
+            range(len(seg_poses)),
+            key=lambda i: math.hypot(seg_poses[i].pose.position.x - rx,
+                                     seg_poses[i].pose.position.y - ry))
+        # Keep the nearest pose itself rather than skipping to the next one: if
+        # the rover is genuinely on top of it, RemovePassedGoals drops it on the
+        # first tick, whereas skipping early would shortcut a real corner.
+        # Always leave at least the final pose so the goal list is never empty.
+        return seg_poses[nearest:] or seg_poses[-1:]
+
     def _wait_at_stop(self, waypoint_idx):
         """Publish stop-reached event and block until confirmation or stop command."""
         sorted_keys = sorted(self.stops.keys())
@@ -424,11 +458,21 @@ class RouteWaypointFollower(Node):
                         _clear_nav_target()
                         self.get_logger().info("Navigation stopped while paused.")
                         return
-                    # Re-issue the WHOLE segment: RemovePassedGoals in the BT
-                    # prunes the poses already behind the rover, so replaying
-                    # the full list resumes correctly without tracking progress.
-                    self.get_logger().info(f"Resumed — re-issuing segment {seg_no}")
-                    self.navigator.goThroughPoses(seg_poses)
+                    # Re-issue only the poses still AHEAD of the rover.
+                    #
+                    # This previously re-sent the whole segment, on the incorrect
+                    # assumption that RemovePassedGoals would drop the ones
+                    # already behind. It cannot: that node pops goals off the
+                    # FRONT only while goal[0] is within its radius and stops at
+                    # the first one that is not. Resuming at waypoint 20 of 37
+                    # puts waypoint 1 at goal[0], ~19m away — nothing is pruned,
+                    # and the rover drives all the way back to the start of the
+                    # segment. Trim here instead of relying on the BT.
+                    remaining = self._poses_ahead(seg_poses)
+                    self.get_logger().info(
+                        f"Resumed — re-issuing segment {seg_no} from the nearest "
+                        f"pose ahead ({len(remaining)}/{len(seg_poses)} poses remain)")
+                    self.navigator.goThroughPoses(remaining)
 
             result = self.navigator.getResult()
             # A non-SUCCEEDED result does NOT stop the run — the survey advances
