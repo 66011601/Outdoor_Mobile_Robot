@@ -20,7 +20,26 @@
                  failure falls through to the unsmoothed path instead of
                  dropping the plan and triggering recovery. -->
             <ReactiveSequence>
-              <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="0.7"/>
+              <!-- radius RAISED 0.7 -> 1.5. This is the "robot goes back to a
+                   waypoint it already passed" fix.
+                   RemovePassedGoals is PROXIMITY-based, not progress-based: it
+                   pops goals off the FRONT only while goal[0] is within radius,
+                   and stops at the first one that isn't. So a waypoint the rover
+                   passed to the SIDE by more than radius is never removed — it
+                   stays as goal[0], and ComputePathThroughPoses keeps planning
+                   back to it. The rover was correctly following a path that
+                   genuinely pointed backwards.
+                   0.7 was far too tight for how this robot actually drives:
+                   xy_goal_tolerance is 1.0 (RTK FLOAT-sized), and RPP steers to
+                   a carrot at min_lookahead_dist 1.5, so it systematically cuts
+                   inside corners and passes intermediate points by up to about
+                   that much. Matching radius to min_lookahead_dist (1.5) means a
+                   point the controller deliberately steered wide of still counts
+                   as passed.
+                   Side effect, intended: with ~1m waypoint spacing this prunes
+                   1-2 points at a time, so the active goal sits ~1.5-2m ahead.
+                   These are route-SHAPE points, not stops, so that is fine. -->
+              <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="1.5"/>
               <ComputePathThroughPoses goals="{goals}" path="{path}" planner_id="GridBased"/>
               <Fallback name="SmoothOrPassThrough">
                 <SmoothPath unsmoothed_path="{path}" smoothed_path="{path}" smoother_id="simple_smoother"/>

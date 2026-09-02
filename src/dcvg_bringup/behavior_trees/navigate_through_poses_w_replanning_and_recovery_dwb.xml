@@ -13,7 +13,10 @@
         <RateController hz="1.5">
           <RecoveryNode number_of_retries="1" name="ComputePathThroughPoses">
             <ReactiveSequence>
-              <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="0.7"/>
+              <!-- radius 0.7 -> 1.5, matched to the RPP variant: this is a route-geometry
+                   property, not a controller property, so leaving the A/B arms
+                   different would confound the comparison. -->
+              <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="1.5"/>
               <ComputePathThroughPoses goals="{goals}" path="{path}" planner_id="GridBased"/>
             </ReactiveSequence>
             <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
