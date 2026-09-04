@@ -137,8 +137,30 @@ class RouteWaypointFollower(Node):
         # coarsens the path the planner is asked to follow. 0.3 keeps every real
         # ~1m point while still collapsing true duplicates.
         self.declare_parameter('min_wp_distance',    0.3)
+        # Route simplification: a waypoint is kept only where the route actually
+        # turns by more than this. Straight runs of interpolated points collapse
+        # to their endpoints. 12 deg sits in the middle of the 10-15 deg band
+        # that reads as "still the same straight" on a dirt road. Set to 0 to
+        # disable simplification entirely.
+        self.declare_parameter('simplify_angle_deg', 12.0)
+        # Hard cap on how long a collapsed straight may get. The global costmap
+        # is rolling 100x100m (~50m around the robot), so a goal beyond that
+        # falls outside it and planning to it fails.
+        self.declare_parameter('simplify_max_run_m', 12.0)
+        # Hard cap on how far the collapsed straight may deviate from the real
+        # route. The angle test alone does not bound this — on a tight bend the
+        # bearing can creep under tolerance while the chord cuts the corner by
+        # metres (measured 1.9m on a 10m-radius arc). 0.4m keeps the cut well
+        # inside the 1.0m localization noise the rover already lives with.
+        self.declare_parameter('simplify_max_deviation_m', 0.4)
         self.min_start_dist: float = float(self.get_parameter('min_start_distance').value)
         self.min_wp_dist:    float = float(self.get_parameter('min_wp_distance').value)
+        self.simplify_angle_deg: float = float(
+            self.get_parameter('simplify_angle_deg').value)
+        self.simplify_max_run_m: float = float(
+            self.get_parameter('simplify_max_run_m').value)
+        self.simplify_max_deviation_m: float = float(
+            self.get_parameter('simplify_max_deviation_m').value)
 
         with open(wps_file_path, 'r') as f:
             data = yaml.safe_load(f)
@@ -209,6 +231,99 @@ class RouteWaypointFollower(Node):
         pose.pose.position.z = mp.z
         pose.pose.orientation = quaternion_from_euler(0.0, 0.0, yaw)
         return pose
+
+    def _simplify(self, seg_poses):
+        """Collapse runs of near-collinear waypoints into their endpoints.
+
+        WHY THIS EXISTS
+        ───────────────
+        osm_route_generator's densify() LINEARLY INTERPOLATES between OSM nodes,
+        so on a straight stretch the 1m points are exactly collinear — they carry
+        no information their endpoints don't. Handing all of them to
+        ComputePathThroughPoses as separate goals does not make the robot follow
+        the road more accurately; it just gives the planner ~150 goals to thread
+        for what is geometrically 4 corners, and gives RemovePassedGoals 150
+        chances to disagree about which one is "next".
+
+        Note this is the only lever available for "tell the planner which way to
+        point". Intermediate pose ORIENTATIONS cannot do it: NavFn is a 2D grid
+        planner and ComputePathThroughPoses only uses goal positions, so a yaw
+        set on an intermediate waypoint is silently ignored. Which points exist
+        is what shapes the path.
+
+        A point is kept when the route actually turns there — bearing from the
+        current anchor deviates by more than `simplify_angle_deg` — so straights
+        become one long goal-to-goal leg the planner renders as a straight line,
+        and corners stay corners.
+
+        The run is also capped by `simplify_max_run_m` for a hard reason: the
+        global costmap is ROLLING 100x100m, so it only covers ~50m around the
+        robot. A goal further out than that falls outside the costmap and
+        planning to it fails. The cap keeps every goal comfortably inside.
+
+        First and last pose are always kept. Since segments are split AT stops,
+        keeping the last pose means every DCVG measurement stop survives
+        simplification untouched.
+        """
+        tol = math.radians(self.simplify_angle_deg)
+        max_run = self.simplify_max_run_m
+        if self.simplify_angle_deg <= 0.0 or len(seg_poses) <= 2:
+            return seg_poses
+
+        def xy(p):
+            return p.pose.position.x, p.pose.position.y
+
+        def bearing(a, b):
+            (ax, ay), (bx, by) = xy(a), xy(b)
+            return math.atan2(by - ay, bx - ax)
+
+        def dist(a, b):
+            (ax, ay), (bx, by) = xy(a), xy(b)
+            return math.hypot(bx - ax, by - ay)
+
+        max_dev = self.simplify_max_deviation_m
+
+        def chord_deviation(a_idx, b_idx):
+            """Max perpendicular distance of the points between a and b from the
+            straight chord a->b. The angle test alone does NOT bound this: on a
+            tight bend, bearing can creep under the tolerance while the collapsed
+            chord cuts the corner by metres. Measured at 1.9m on a 10m-radius arc
+            before this cap existed, against a 1.0m localization noise floor —
+            i.e. enough to put the rover off a dirt road."""
+            (ax, ay), (bx, by) = xy(seg_poses[a_idx]), xy(seg_poses[b_idx])
+            dx, dy = bx - ax, by - ay
+            L2 = dx * dx + dy * dy
+            worst = 0.0
+            for k in range(a_idx + 1, b_idx):
+                px, py = xy(seg_poses[k])
+                if L2 <= 1e-12:
+                    worst = max(worst, math.hypot(px - ax, py - ay))
+                    continue
+                t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / L2))
+                worst = max(worst, math.hypot(px - (ax + t * dx), py - (ay + t * dy)))
+            return worst
+
+        out = [seg_poses[0]]
+        anchor = 0
+        i = 1
+        while i < len(seg_poses) - 1:
+            base = bearing(seg_poses[anchor], seg_poses[i])
+            nxt = bearing(seg_poses[anchor], seg_poses[i + 1])
+            turned = abs(wrap(nxt - base)) > tol
+            too_long = dist(seg_poses[anchor], seg_poses[i + 1]) > max_run
+            bulges = chord_deviation(anchor, i + 1) > max_dev
+            if turned or too_long or bulges:
+                out.append(seg_poses[i])     # keep the corner / cap the run
+                anchor = i
+            i += 1
+        out.append(seg_poses[-1])
+
+        if len(out) < len(seg_poses):
+            self.get_logger().info(
+                f"    simplified {len(seg_poses)} -> {len(out)} goal(s) "
+                f"(straight runs collapsed at >{self.simplify_angle_deg:.0f} deg, "
+                f"capped at {max_run:.0f} m)")
+        return out
 
     def _poses_ahead(self, seg_poses):
         """Return the tail of seg_poses starting at the pose nearest the rover.
@@ -409,7 +524,10 @@ class RouteWaypointFollower(Node):
             f"({len(poses)} waypoints, {len(self.stops)} stop(s))")
 
         for seg_no, segment in enumerate(segments, start=1):
-            seg_poses = [p for _, p in segment]
+            # Dispatch the SIMPLIFIED point list, but keep `segment` intact for
+            # data-gap accounting — a failed segment still stranded every
+            # original waypoint in it, not just the ones we sent as goals.
+            seg_poses = self._simplify([p for _, p in segment])
             end_orig_idx = segment[-1][0]
             ends_at_stop = end_orig_idx in self.stops
 
