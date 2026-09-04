@@ -241,7 +241,19 @@ controller_server:
       # Unrelated to the rotateToHeading deadlock invariant, which is governed by
       # min_lookahead_dist vs xy_goal_tolerance, not by this angle.
       rotate_to_heading_min_angle: 1.0
-      rotate_to_heading_angular_vel: 1.0
+      # 1.0 -> 0.5. Direct mitigation for heading-estimate LAG, not a tuning
+      # preference. The fused heading trails the true heading (visible in
+      # osm_route_app: the model rotates slower than the robot), so an in-place
+      # rotation physically overshoots by about omega * lag before the estimate
+      # registers that it is aligned and stops the turn. Halving omega halves the
+      # overshoot: at a 0.3s lag that is 17 deg -> 8.6 deg of residual heading
+      # error left at the end of every rotation.
+      # Cost is turn time — a 90 deg pivot goes 1.6s -> 3.1s — which is cheap now
+      # that rotate_to_heading_min_angle is 1.0 rad and pivots are rare. Worst-
+      # case goal rotation is 3.5s, still well inside the 8s progress allowance.
+      # This treats the SYMPTOM. The cause is the timestamp/lag handling — see
+      # gps_heading_to_imu heading_latency_s and the EKFs' smooth_lagged_data.
+      rotate_to_heading_angular_vel: 0.5
       max_angular_accel: 1.5
       max_robot_pose_search_dist: 5.0
       use_interpolation: true
