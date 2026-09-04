@@ -35,6 +35,7 @@ Run (normally started by ublox_gps.launch.py, right after the heading board node
 import math
 
 import rclpy
+from rclpy.duration import Duration
 from rclpy.node import Node
 
 from sensor_msgs.msg import Imu
@@ -78,8 +79,14 @@ class GpsHeadingToImu(Node):
 
         self.declare_parameter('heading_offset_deg', 0.0)
         self.declare_parameter('min_heading_std_deg', MIN_HEADING_STD_DEG)
+        # Seconds to backdate the heading stamp by — the measurement's true age
+        # when it reaches this node. 0.0 keeps the previous (dishonest)
+        # behaviour; see the stamping comment below for why that lags the fused
+        # heading. Measure with heading_check before setting.
+        self.declare_parameter('heading_latency_s', 0.0)
         self._offset_rad = float(self.get_parameter('heading_offset_deg').value) * DEG_TO_RAD
         self._min_std_rad = float(self.get_parameter('min_heading_std_deg').value) * DEG_TO_RAD
+        self._latency_s = max(0.0, float(self.get_parameter('heading_latency_s').value))
 
         self._pub = self.create_publisher(Imu, '/gps/heading/imu', 10)
         self.create_subscription(
@@ -117,7 +124,21 @@ class GpsHeadingToImu(Node):
         yaw_var = std_rad * std_rad
 
         out = Imu()
-        out.header.stamp = self.get_clock().now().to_msg()
+        # Backdate to when the GPS actually MEASURED this heading, not when this
+        # node happened to receive it. The real measurement is older by the RTK
+        # solve + serial + driver time. Stamping now() tells robot_localization a
+        # stale heading is current, so every correction drags the estimate back
+        # toward where the robot was heading_latency_s ago — which shows up as
+        # the operator-map model rotating slower than the real robot, and leaves
+        # residual heading error at the end of every in-place rotation.
+        # Only useful together with the EKFs' smooth_lagged_data (enabled in
+        # dual_ekf_navsat_params.yaml): that is what lets the filter rewind to
+        # this timestamp, fuse there, and replay forward.
+        # Default 0.0 preserves the old behaviour — measure the real value with
+        # `ros2 run dcvg_bringup heading_check` (it reports an estimated lag by
+        # cross-correlating this heading against gyro-integrated yaw) and set it.
+        stamp_t = self.get_clock().now() - Duration(seconds=self._latency_s)
+        out.header.stamp = stamp_t.to_msg()
         out.header.frame_id = 'gps_heading_link'
 
         half_yaw = yaw / 2.0

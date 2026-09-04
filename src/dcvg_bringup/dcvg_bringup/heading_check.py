@@ -108,6 +108,7 @@ class HeadingCheck(Node):
         self._csv = csv.DictWriter(self._f, fieldnames=FIELDS)
         self._csv.writeheader()
         self._rows = []
+        self._lag_rows = []
         self._t0 = self._now()
 
         self.create_timer(1.0 / float(self.get_parameter('rate').value), self._tick)
@@ -164,6 +165,10 @@ class HeadingCheck(Node):
         self._rows.append((t, tf_yaw, gps_yaw,
                            None if (tf_yaw is None or gps_yaw is None)
                            else wrap(tf_yaw - gps_yaw)))
+        # local_yaw is gyro/VIO-driven and effectively lag-free relative to the
+        # GPS heading, so cross-correlating the two recovers the GPS lag.
+        if self._local is not None and gps_yaw is not None:
+            self._lag_rows.append((t, self._local, gps_yaw))
 
         if self.duration > 0 and t >= self.duration:
             self.report()
@@ -206,6 +211,17 @@ class HeadingCheck(Node):
         print(f'  DRIFT RATE             : {deg(slope)*60:+.2f} deg/min')
         print(f'  projected over 10 min  : {deg(slope)*600:+.1f} deg')
         print()
+        lag = self.estimate_lag()
+        if lag == 'static':
+            print('  LAG: not measurable — the robot barely rotated during this run.')
+            print('       Re-run while turning; lag only shows up in yaw motion.')
+        elif lag is not None:
+            print(f'  ESTIMATED GPS HEADING LAG: {lag:.2f} s')
+            print(f'    -> set heading_latency_s:={lag:.2f} on gps_heading_to_imu')
+            print(f'    -> at {lag:.2f}s, rotating at 0.5 rad/s overshoots '
+                  f'{math.degrees(0.5*lag):.1f} deg before the estimate catches up')
+        print()
+
         drift_per_min = abs(deg(slope) * 60)
         if drift_per_min > 1.0:
             print('  VERDICT: DIVERGENCE. The fused heading is walking away from the')
@@ -229,6 +245,38 @@ class HeadingCheck(Node):
         else:
             print('  VERDICT: heading looks healthy. Cause of the zigzag is elsewhere.')
         print('=' * 72)
+
+    def estimate_lag(self):
+        """Estimate how far the GPS heading TRAILS the fast local estimate.
+
+        local_yaw (gyro + VIO driven) responds essentially immediately; gps_yaw
+        carries the RTK solve + serial + driver delay. Shifting gps_yaw forward
+        in time and finding the shift that best matches local_yaw recovers that
+        delay. Needs actual ROTATION in the data — a straight run has no yaw
+        signal to correlate and will report nothing useful.
+        """
+        if len(self._lag_rows) < 40:
+            return None
+        ts = [r[0] for r in self._lag_rows]
+        dt = statistics.median(
+            [ts[i + 1] - ts[i] for i in range(len(ts) - 1)]) or 0.1
+        loc = [r[1] for r in self._lag_rows]
+        gps = [r[2] for r in self._lag_rows]
+        # Need real yaw motion, else correlation is meaningless.
+        if math.degrees(statistics.pstdev(loc)) < 5.0:
+            return 'static'
+        best, best_err = None, None
+        max_shift = int(round(1.0 / dt))          # search up to 1.0s of lag
+        for k in range(0, max_shift + 1):
+            # compare gps[i] against local from k samples EARLIER
+            errs = [abs(wrap(gps[i] - loc[i - k]))
+                    for i in range(k, len(gps))]
+            if not errs:
+                continue
+            e = statistics.mean(errs)
+            if best_err is None or e < best_err:
+                best_err, best = e, k * dt
+        return best
 
     def close(self):
         try:
