@@ -32,6 +32,21 @@ ekf_filter_node_odom:
     debug: false
     publish_tf: true
 
+    # Delayed-measurement handling. Every absolute source on this robot arrives
+    # LATE relative to when it was actually measured: RTAB-Map's /vo lags by the
+    # image pipeline, and the GPS moving-baseline heading lags by the RTK solve
+    # plus serial plus driver. Without these two, robot_localization fuses each
+    # late measurement as if it described the CURRENT state, which drags the
+    # estimate back toward where the robot was a moment ago — visible on the
+    # operator map as the model rotating slower than the real robot.
+    # With them, the filter keeps a state history, rewinds to the measurement's
+    # own timestamp, fuses there, and replays forward. That only works for
+    # HONESTLY timestamped messages, which is why gps_heading_to_imu's
+    # heading_latency_s exists — a message stamped now() has no lag to recover.
+    # 1.0s of history comfortably covers both sensors' delay at 30Hz.
+    smooth_lagged_data: true
+    history_length: 1.0
+
     map_frame: map
     odom_frame: odom
     base_link_frame: base_footprint
@@ -97,6 +112,21 @@ ekf_filter_node_map:
     print_diagnostics: true
     debug: false
     publish_tf: true
+
+    # Delayed-measurement handling. Every absolute source on this robot arrives
+    # LATE relative to when it was actually measured: RTAB-Map's /vo lags by the
+    # image pipeline, and the GPS moving-baseline heading lags by the RTK solve
+    # plus serial plus driver. Without these two, robot_localization fuses each
+    # late measurement as if it described the CURRENT state, which drags the
+    # estimate back toward where the robot was a moment ago — visible on the
+    # operator map as the model rotating slower than the real robot.
+    # With them, the filter keeps a state history, rewinds to the measurement's
+    # own timestamp, fuses there, and replays forward. That only works for
+    # HONESTLY timestamped messages, which is why gps_heading_to_imu's
+    # heading_latency_s exists — a message stamped now() has no lag to recover.
+    # 1.0s of history comfortably covers both sensors' delay at 30Hz.
+    smooth_lagged_data: true
+    history_length: 1.0
 
     map_frame: map
     odom_frame: odom
