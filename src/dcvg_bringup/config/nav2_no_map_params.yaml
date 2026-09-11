@@ -132,7 +132,6 @@ controller_server:
       # checker fires and the point is logged as a data gap. Watch for those
       # gaps — if they appear, 0.5m is the fallback before anything else moves.
       xy_goal_tolerance: 0.4
-      # Don't require the robot to align heading at each GPS waypoint
       yaw_goal_tolerance: 1.57
     # Regulated Pure Pursuit — ACTIVE controller (ported from sim validation).
     #
@@ -192,7 +191,13 @@ controller_server:
       # is simply false with this much dead time, and the depth camera only
       # marks obstacles to 3.0m. Restore this only when measured stop latency
       # shows the assumption holds.
-      desired_linear_vel: 0.5
+      # 0.5 -> 0.25. Forced by stop latency, not by preference: overrun past a
+      # stop point is speed x latency, and at 0.5 m/s against the observed ~1s
+      # stop delay that is 0.50m — LARGER than the 0.4m goal tolerance, so the
+      # rover could never stop inside tolerance at any tuning. 0.25 halves it.
+      # Revisit once velocity_timeout and the real stop latency are measured;
+      # if latency drops to ~0.25s this can go back up.
+      desired_linear_vel: 0.25
       lookahead_dist: 1.5
       min_lookahead_dist: 0.6
       max_lookahead_dist: 1.0
@@ -549,14 +554,32 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [1.5, 0.0, 1.5]
-    min_velocity: [-1.5, 0.0, -1.5]
-    max_accel: [2.5, 0.0, 3.2]
+    # Speed envelope sized to the STOP LATENCY, not to what the drivetrain can
+    # do. Overrun past a stop point = speed x latency, and every metre of that
+    # lands outside the 0.4m goal tolerance. The smoother was allowing 1.5 m/s
+    # while the controller only asks for 0.25 — dead headroom that does nothing
+    # but widen the worst case if anything ever commands more.
+    max_velocity: [0.3, 0.0, 1.0]
+    min_velocity: [-0.3, 0.0, -1.0]
+    # Acceleration cut 2.5 -> 0.4 m/s^2. Two reasons, both field-motivated:
+    #   - At 2.5 the rover hit cruise in 0.10s over 13mm, i.e. it was at full
+    #     speed for 99% of a 2m hop. Gentler ramp keeps average speed (and so
+    #     overrun) lower across the whole hop, not just at the start.
+    #   - This is a TRACKED chassis: hard acceleration breaks traction, and
+    #     track-vs-ground slip is invisible to the Teensy's sprocket PID and
+    #     corrupts VIO. Gentler starts mean less slip and a cleaner heading.
+    # Deceleration is deliberately NOT softened — see the comment below.
+    max_accel: [0.4, 0.0, 1.0]
     # Raised from -2.5/-3.2 (stopping distance ~0.45m -> ~0.33m at 1.5 m/s).
     # DWB's decel_lim_x is -5.0, so the smoother, not the controller, was the
     # bottleneck on an emergency stop. Stepped to -3.0/-3.6 rather than the
     # full -4.0/-4.5 target - verify the drivetrain accepts this without
     # skidding/faulting at low speed, kill-switch in hand, before going further.
+    # Kept STRONG on purpose, and this agrees with the field comment above rather
+    # than contradicting it: acceleration and deceleration are asymmetric here.
+    # Gentle acceleration is wanted (traction, slip, overrun); fast deceleration
+    # is wanted (the whole problem is stopping late). Softening decel would make
+    # the reported symptom worse.
     max_decel: [-3.0, 0.0, -3.6]
     odom_topic: "odometry/local"
     odom_duration: 0.1
