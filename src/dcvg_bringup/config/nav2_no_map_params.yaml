@@ -259,7 +259,12 @@ controller_server:
       # This treats the SYMPTOM. The cause is the timestamp/lag handling — see
       # gps_heading_to_imu heading_latency_s and the EKFs' smooth_lagged_data.
       rotate_to_heading_angular_vel: 0.5
-      max_angular_accel: 1.5
+      # 1.5 -> 0.5 to MATCH velocity_smoother's angular accel limit. RPP uses this
+      # to clamp its own angular command, so leaving it at 1.5 meant RPP planned
+      # ramps the smoother then clipped at 1.0 — the controller reasoning about a
+      # vehicle more responsive than the one it actually commands. Matching them
+      # keeps RPP's internal model honest.
+      max_angular_accel: 0.5
       max_robot_pose_search_dist: 5.0
       use_interpolation: true
 
@@ -569,7 +574,27 @@ velocity_smoother:
     #     track-vs-ground slip is invisible to the Teensy's sprocket PID and
     #     corrupts VIO. Gentler starts mean less slip and a cleaner heading.
     # Deceleration is deliberately NOT softened — see the comment below.
-    max_accel: [0.4, 0.0, 1.0]
+    # 0.4 -> 0.2 m/s^2 linear, 1.0 -> 0.5 rad/s^2 angular. Softer again, since
+    # slower-but-working is the accepted tradeoff.
+    #
+    # THERE IS A FLOOR, and it is worth recording so nobody drops this to 0.05
+    # expecting it to keep improving. The ramp starts at zero, and the tracks do
+    # not break away from stiction until the command clears it. Gentler
+    # acceleration means the command spends LONGER below breakaway, and that time
+    # is added to the ~0.6s mechanical delay before the rover physically moves:
+    #     0.4 m/s^2 -> cmd passes 0.10 m/s at 0.25s
+    #     0.2 m/s^2 -> 0.50s
+    #     0.1 m/s^2 -> 1.00s   <- now over a second of standstill before motion
+    # 0.2 keeps the accel phase at 1.25s / 0.156m, about 8% of a 2m hop, without
+    # turning the start of every hop into dead time. Below roughly 0.15 the dead
+    # time starts costing more than the smoothness is worth.
+    #
+    # Angular halved for a tracked-chassis reason specifically: an in-place pivot
+    # counter-rotates both tracks, which is the maximum-scrub case and the single
+    # largest slip source on this robot. Slip there is invisible to the Teensy's
+    # sprocket PID and corrupts VIO, so gentler pivots should also mean a cleaner
+    # heading — which is the actual complaint upstream of all of this.
+    max_accel: [0.2, 0.0, 0.5]
     # Raised from -2.5/-3.2 (stopping distance ~0.45m -> ~0.33m at 1.5 m/s).
     # DWB's decel_lim_x is -5.0, so the smoother, not the controller, was the
     # bottleneck on an emergency stop. Stepped to -3.0/-3.6 rather than the
