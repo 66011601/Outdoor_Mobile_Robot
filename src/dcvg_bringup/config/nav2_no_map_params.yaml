@@ -584,7 +584,26 @@ velocity_smoother:
     odom_topic: "odometry/local"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
-    velocity_timeout: 1.0
+    # 1.0 -> 0.25. THIS IS THE ~1 SECOND STOP DELAY.
+    # nav2_velocity_smoother does not zero the output the moment commands stop
+    # arriving. It keeps smoothing toward the LAST command it received until
+    # velocity_timeout expires, and only then treats the command as zero. So
+    # whenever the upstream stops publishing instead of sending an explicit zero
+    # — an action cancelled, a BT halt, the follower exiting on Stop, a starved
+    # controller missing its cycle — the rover keeps driving at the last
+    # commanded velocity for up to a full second before anything tells it to
+    # stop.
+    # It also actively defeats the motor watchdog: low_level_command stops the
+    # motors after 0.5s of silence on /cmd_vel, but the smoother is still
+    # publishing at 20Hz throughout that window, so the watchdog never fires.
+    # 0.25s is 5 missed commands at the 20Hz controller rate — enough slack for
+    # ordinary jitter, while cutting worst-case coasting from 1.0s to 0.25s
+    # (0.25m of overrun at 0.25 m/s, down from 0.5m).
+    # TRADEOFF: this platform has documented CPU starvation. A stall longer than
+    # 0.25s now produces a brief STOP rather than continued coasting. That is
+    # stuttery but it is the safe direction — coasting on a stale command with no
+    # sensor confirming it is the failure mode worth eliminating first.
+    velocity_timeout: 0.25
 
 route_server:
   ros__parameters:
