@@ -14,3 +14,9 @@ __pycache__/
 
 # OS
 .DS_Store
+*.db3
+*.mcap
+src/my_route/
+build/
+install/
+log/

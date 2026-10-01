@@ -82,7 +82,7 @@ class GpsHeadingToImu(Node):
         # Seconds to backdate the heading stamp by — the measurement's true age
         # when it reaches this node. 0.0 keeps the previous (dishonest)
         # behaviour; see the stamping comment below for why that lags the fused
-        # heading. Measure with heading_check before setting.
+        # heading. Measure the real value before setting.
         self.declare_parameter('heading_latency_s', 0.0)
         self._offset_rad = float(self.get_parameter('heading_offset_deg').value) * DEG_TO_RAD
         self._min_std_rad = float(self.get_parameter('min_heading_std_deg').value) * DEG_TO_RAD
@@ -134,9 +134,9 @@ class GpsHeadingToImu(Node):
         # Only useful together with the EKFs' smooth_lagged_data (enabled in
         # dual_ekf_navsat_params.yaml): that is what lets the filter rewind to
         # this timestamp, fuse there, and replay forward.
-        # Default 0.0 preserves the old behaviour — measure the real value with
-        # `ros2 run dcvg_bringup heading_check` (it reports an estimated lag by
-        # cross-correlating this heading against gyro-integrated yaw) and set it.
+        # Default 0.0 preserves the old behaviour — measure the real value by
+        # cross-correlating this heading against gyro-integrated yaw during an
+        # in-place rotation, and set it to the lag that best aligns the two.
         stamp_t = self.get_clock().now() - Duration(seconds=self._latency_s)
         out.header.stamp = stamp_t.to_msg()
         out.header.frame_id = 'gps_heading_link'

@@ -21,6 +21,8 @@ Chain:
   6. localization.launch.py → dual EKF + navsat_transform
   7. rtabmap.launch.py      → /vo + /camera/depth/obstacles
   8. nav2_bringup           → full Nav2 stack with the custom recovery BTs
+  9. teensy_feedback_server → /teensy/feedback + DCVG meter OCR + /gps/fix
+                              → 17-field frames over TCP :5005 to the laptop
 
 Everything runs with use_sim_time:=False.
 
@@ -47,6 +49,8 @@ Usage:
   ros2 launch dcvg_bringup bringup.launch.py use_stereo:=true use_rviz:=True
   ros2 launch dcvg_bringup bringup.launch.py controller_type:=dwb   # A/B vs RPP (default)
   ros2 launch dcvg_bringup bringup.launch.py max_accel_linear:=0.3  # accel sweep, see below
+  ros2 launch dcvg_bringup bringup.launch.py enable_ocr:=False      # no meter camera connected
+  ros2 launch dcvg_bringup bringup.launch.py use_telemetry:=False   # no laptop uplink at all
 """
 
 import os
@@ -197,6 +201,17 @@ def generate_launch_description():
         DeclareLaunchArgument('heading_offset_deg', default_value='0.0',
             description='GPS heading antenna mounting offset (deg) — calibrate against '
                         'a known heading once on hardware, see gps_heading_to_imu.py'),
+        DeclareLaunchArgument('use_telemetry', default_value='True',
+            description='Run teensy_feedback_server — stamps the DCVG meter reading '
+                        'and the RTK position onto the Teensy frames and serves them '
+                        'to the laptop over TCP. Purely outbound: nothing in the '
+                        'navigation stack depends on it.'),
+        DeclareLaunchArgument('telemetry_port', default_value='5005',
+            description='TCP port teensy_feedback_server serves the laptop on'),
+        DeclareLaunchArgument('enable_ocr', default_value='True',
+            description='Read the DCVG meter display over the USB webcam. False stamps '
+                        '0,0 instead and needs no camera — use it when surveying '
+                        'without the meter, or to rule the OCR out while debugging.'),
         DeclareLaunchArgument('min_heading_std_deg', default_value='2.0',
             description='Floor on GPS-heading yaw std-dev — realistic sensor-accuracy '
                         'floor; see gps_heading_to_imu.py for why this no longer needs '
@@ -208,11 +223,11 @@ def generate_launch_description():
         # shrink it once you've confirmed the stage comes up reliably before it fires.
         DeclareLaunchArgument('sensors_delay', default_value='2.0',
             description='Delay before starting the RealSense driver + IMU filter'),
-        DeclareLaunchArgument('gps_delay', default_value='12.0',
+        DeclareLaunchArgument('gps_delay', default_value='20.0',
             description='Delay before starting the GPS/RTK drivers (after RealSense init)'),
-        DeclareLaunchArgument('ntrip_delay', default_value='9.0',
+        DeclareLaunchArgument('ntrip_delay', default_value='20.0',
             description='Delay before starting the NTRIP client (needs GPS driver + fix)'),
-        DeclareLaunchArgument('motor_delay', default_value='9.0',
+        DeclareLaunchArgument('motor_delay', default_value='12.0',
             description='Delay before starting low_level_command (independent of GPS/NTRIP)'),
         DeclareLaunchArgument('localization_delay', default_value='12.0',
             description='Delay before starting the dual EKF + navsat_transform'),
@@ -222,6 +237,13 @@ def generate_launch_description():
             description='Delay before starting Nav2 (needs TF tree + odometry + costmap sources up)'),
         DeclareLaunchArgument('rviz_delay', default_value='22.0',
             description='Delay before starting RViz'),
+        DeclareLaunchArgument('telemetry_delay', default_value='24.0',
+            description='Delay before starting teensy_feedback_server. Last in the '
+                        'chain deliberately: loading the easyocr model pulls torch onto '
+                        'the GPU, and doing that while RealSense and RTAB-Map are still '
+                        'initialising competes with them on the Orin. Nothing waits on '
+                        'it — it only forwards telemetry, so starting late costs a few '
+                        'seconds of survey data, not navigation.'),
         # TODO: split a hardware-specific (Gazebo-free) robot description out of the
         # sim package. For now reuse the sim xacro — robot_state_publisher ignores
         # the <gazebo> plugin tags, so the TF tree it publishes is correct.
@@ -329,6 +351,30 @@ def generate_launch_description():
                 PythonLaunchDescriptionSource(
                     os.path.join(bringup_dir, 'launch', 'rviz_launch.py')),
                 condition=IfCondition(use_rviz),
+            )],
+        ),
+
+        # Survey telemetry uplink. Subscribes to low_level_command's
+        # /teensy/feedback and ublox_gps's /gps/fix, so it is started after both
+        # — though neither is a hard ordering requirement, since a ROS
+        # subscription made before its publisher exists simply connects later.
+        TimerAction(
+            period=LaunchConfiguration('telemetry_delay'),
+            actions=[Node(
+                package='dcvg_bringup',
+                executable='teensy_feedback_server',
+                name='teensy_feedback_server',
+                output='screen',
+                parameters=[{
+                    # value_type is required: a LaunchConfiguration performs to a
+                    # string, and the node declares these as int/bool, so without
+                    # it rcl rejects the override on a type mismatch.
+                    'tcp_port': ParameterValue(
+                        LaunchConfiguration('telemetry_port'), value_type=int),
+                    'enable_ocr': ParameterValue(
+                        LaunchConfiguration('enable_ocr'), value_type=bool),
+                }],
+                condition=IfCondition(LaunchConfiguration('use_telemetry')),
             )],
         ),
     ])

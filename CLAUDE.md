@@ -100,12 +100,13 @@ physically connected camera yet** — confirm here once hardware is connected.
 Depth camera (RGB+Depth+IMU) → RTAB-Map rgbd/stereo_odometry → /vo → ekf_local
                               → obstacles_detection (ground filtered) → /camera/depth/obstacles → Nav2 costmap
 GPS (fix) → navsat_transform → /odometry/gps ─────────────────────→ ekf_global
-IMU (data) ───────────────────────────────────────────────────────→ ekf_local only (see Known Issues)
-GPS heading (navrelposned) → gps_heading_to_imu → /gps/heading/imu ──→ ekf_global (yaw)
+IMU (data) → imu_throttle → /imu/data_throttled ───────────────────→ BOTH EKFs, yaw RATE only
+GPS heading (navrelposned) → gps_heading_to_imu → /gps/heading/imu ──→ BOTH EKFs (absolute yaw)
 
 robot_localization:
-  ekf_local  (world=odom): /vo velocity + camera-gyro IMU yaw  → odom → base_footprint (smooth, may drift)
-  ekf_global (world=map):  GPS position + GPS heading yaw only → map → odom (GPS-anchored, zero drift)
+  ekf_local  (world=odom): /vo vel + gyro yaw RATE + GPS heading yaw → odom → base_footprint (smooth, may drift)
+  ekf_global (world=map):  GPS position + gyro yaw RATE + GPS heading yaw → map → odom (GPS-anchored, zero drift)
+  Neither EKF fuses the camera's ABSOLUTE yaw — only its rate (see Known Issues).
 
 Nav2 → /cmd_vel → low_level_command → Teensy → Pololu G2s → robot moves
 
@@ -205,6 +206,18 @@ separately, on demand, from the web UI.
 - **Intel RealSense D455/D457** — depth + IMU for VIO. D455: 95 mm baseline, depth 0.6–6 m, BMI270 IMU. D457: IR stereo pair, passive (sunlight-immune), longer range.
 - **Jetson Orin Nano** — companion computer (ROS2 Humble native, no Docker).
 - **simpleRTK2B Heading (u-blox ZED-F9P)** — RTK GPS module, native USB UBX; RTK corrections via NTRIP (`ublox_gps` + `ntrip_client` + `ntrip_bridge`).
+  - **Antenna mounting (measured 2026-09-14).** Both antennas on the robot's centreline:
+    **HEADING antenna at the FRONT, POSITION antenna at the REAR.** The position antenna
+    (the one producing `/gps/fix`) sits **0.60 m behind `base_link`** and **1.00 m above the
+    ground** — modelled as `gps_link` at `xyz="-0.60 0 0.92"` in the xacro (0.92 = 1.00 −
+    `base_height` 0.08). That 0.60 m lever arm is **not cosmetic**: with it unmodelled, every
+    stop overshot by 0.60 m and every in-place pivot injected an apparent position jump of
+    `2 × 0.60 × sin(θ/2)` — 0.21 m at 20°, 0.85 m at 90°, i.e. bigger than the whole 0.5 m
+    route corridor. That was the root cause of "drives straight fine, loses the route
+    whenever it rotates".
+  - Because the baseline runs **rear (moving base) → front (rover)**, which is `base_link`'s
+    **+X**, `heading_offset_deg` should be **0.0** — the `bringup.launch.py` default is
+    already correct. Confirm once against a known bearing, but expect no 90°/180° offset.
 - **Realsense D457 Depth Camera** — Stereo Depth Camera for visual odometry
 - **Teensy** — reads `/cmd_vel`-derived wheel speeds over serial from `low_level_command` and drives PWM to the Pololu G2s.
 - **Pololu G2 Motor Drivers ×2** — driven by the Teensy.
@@ -256,9 +269,12 @@ separately, on demand, from the web UI.
   launch arg) against a known heading before trusting it: e.g. point the robot at a known
   compass bearing, read the resulting yaw from `/gps/heading/imu` with the offset at 0,
   and set `heading_offset_deg` to `(true_bearing − measured_yaw)`, normalized to [-180,180].
-- `ekf_global` deliberately does **not** fuse `imu0` (the camera's gyro yaw) at all —
-  `dual_ekf_navsat_params.yaml`'s `ekf_filter_node_map` has no `imu0` key. Confirmed on
-  hardware: fusing it alongside GPS heading made `ekf_global`'s yaw *worse*, not better.
+- `ekf_global` fuses the camera IMU's yaw **RATE only**, never its absolute yaw.
+  `dual_ekf_navsat_params.yaml`'s `ekf_filter_node_map` does have an `imu0` key — but its
+  config enables index 11 (`vyaw`) and nothing else, which is what satisfies
+  robot_localization's requirement that yaw or its velocity be observed. Confirmed on
+  hardware: fusing the camera's *absolute* yaw alongside GPS heading made `ekf_global`'s
+  yaw *worse*, not better.
   Reason: `imu_filter_madgwick` runs with `use_mag:=false` (no magnetometer on the
   D455/D457), so its yaw is gyro integration from an arbitrary boot-time reference, fused
   as if absolute — it disagrees with the correctly-referenced GPS heading, and there's no

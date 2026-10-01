@@ -142,7 +142,7 @@ class RouteWaypointFollower(Node):
         # to their endpoints. 12 deg sits in the middle of the 10-15 deg band
         # that reads as "still the same straight" on a dirt road. Set to 0 to
         # disable simplification entirely.
-        self.declare_parameter('simplify_angle_deg', 12.0)
+        self.declare_parameter('simplify_angle_deg', 8.0)
         # Hard cap on how long a collapsed straight may get. The global costmap
         # is rolling 100x100m (~50m around the robot), so a goal beyond that
         # falls outside it and planning to it fails.
@@ -150,9 +150,26 @@ class RouteWaypointFollower(Node):
         # Hard cap on how far the collapsed straight may deviate from the real
         # route. The angle test alone does not bound this — on a tight bend the
         # bearing can creep under tolerance while the chord cuts the corner by
-        # metres (measured 1.9m on a 10m-radius arc). 0.4m keeps the cut well
-        # inside the 1.0m localization noise the rover already lives with.
-        self.declare_parameter('simplify_max_deviation_m', 0.4)
+        # metres (measured 1.9m on a 10m-radius arc).
+        # 0.4 -> 0.15, and the angle test 12 -> 8 deg. The old values were sized
+        # against a 1.0m localization noise floor, i.e. "the cut is smaller than
+        # what we can measure anyway". That is no longer the standard: the rover
+        # must hold better than 0.5m of the surveyed line, so a simplification
+        # allowed to cut 0.4m would spend 80% of the whole budget before the
+        # controller is even involved. 0.15 keeps route simplification an
+        # optimisation rather than a source of error.
+        # NOTE: with stops every ~2m the segments handed to _simplify are only
+        # 2-3 poses long, so it returns early and these are inert TODAY. They
+        # matter the moment stop spacing is widened — keep them honest.
+        self.declare_parameter('simplify_max_deviation_m', 0.15)
+        # What to do when a segment does not finish SUCCEEDED. 'hold' parks the
+        # run and waits for the operator (the rover has already stopped — Nav2
+        # recovery is non-evasive now, so it is sitting on the route line);
+        # 'skip' is the previous behaviour, advancing to the next segment and
+        # logging a data gap. 'hold' is the default because on a live road the
+        # reason a segment failed is usually something in the way, and driving
+        # on to a goal 2m further along means crossing whatever that was.
+        self.declare_parameter('on_segment_failure', 'hold')
         self.min_start_dist: float = float(self.get_parameter('min_start_distance').value)
         self.min_wp_dist:    float = float(self.get_parameter('min_wp_distance').value)
         self.simplify_angle_deg: float = float(
@@ -161,6 +178,13 @@ class RouteWaypointFollower(Node):
             self.get_parameter('simplify_max_run_m').value)
         self.simplify_max_deviation_m: float = float(
             self.get_parameter('simplify_max_deviation_m').value)
+        self.on_segment_failure: str = str(
+            self.get_parameter('on_segment_failure').value).strip().lower()
+        if self.on_segment_failure not in ('hold', 'skip'):
+            self.get_logger().warn(
+                f"on_segment_failure '{self.on_segment_failure}' not understood "
+                f"— falling back to 'hold'")
+            self.on_segment_failure = 'hold'
 
         with open(wps_file_path, 'r') as f:
             data = yaml.safe_load(f)
@@ -277,6 +301,14 @@ class RouteWaypointFollower(Node):
             (ax, ay), (bx, by) = xy(a), xy(b)
             return math.atan2(by - ay, bx - ax)
 
+        def wrap(a):
+            """Fold a bearing difference into (-pi, pi]. bearing() returns atan2's
+            (-pi, pi], so a difference of two bearings spans (-2pi, 2pi): a route
+            bending 2 deg across the +/-pi seam comes out as 358 and would read as
+            a corner. In this ENU map frame that seam sits at due west, so without
+            this every near-straight westbound run would be kept point-for-point."""
+            return math.atan2(math.sin(a), math.cos(a))
+
         def dist(a, b):
             (ax, ay), (bx, by) = xy(a), xy(b)
             return math.hypot(bx - ax, by - ay)
@@ -358,6 +390,45 @@ class RouteWaypointFollower(Node):
         # first tick, whereas skipping early would shortcut a real corner.
         # Always leave at least the final pose so the goal list is never empty.
         return seg_poses[nearest:] or seg_poses[-1:]
+
+    def _hold_for_operator(self, seg_no, total, attempt, result):
+        """Park the run after a failed segment and wait for the operator.
+
+        Safe to hold here precisely BECAUSE Nav2 recovery is non-evasive now
+        (BackUp and Spin were removed from both behavior trees): a failed
+        segment leaves the rover stopped on the route line, not somewhere it
+        improvised to. Holding is the right default on a live road — the usual
+        reason a segment fails is that something is in the way, and advancing to
+        the next stop ~2m further along means driving across whatever that was.
+
+        The operator has exactly the two controls the web app already provides:
+          Run  → retry this same segment (after clearing whatever blocked it)
+          Stop → end the run
+        To get the old advance-past-it behaviour instead, launch with
+        `-p on_segment_failure:=skip`.
+
+        Returns 'retry' or 'stop'.
+        """
+        text = (f"HELD — segment {seg_no}/{total} failed ({result}) on attempt "
+                f"{attempt}. Robot is stopped on the route. Clear the "
+                f"obstruction, then press Run to retry this segment, or Stop to "
+                f"end the run.")
+        _write_cmd('pause')
+        _write_stop_status(text)
+        self.get_logger().error(text)
+
+        while True:
+            cmd = _read_cmd()
+            if cmd == 'stop':
+                _write_stop_status('')
+                self.get_logger().info("Run ended by the operator while held.")
+                return 'stop'
+            if cmd == 'run':
+                _write_stop_status('')
+                self.get_logger().info(
+                    f"Operator resumed — retrying segment {seg_no}")
+                return 'retry'
+            rclpy.spin_once(self, timeout_sec=0.1)
 
     def _wait_at_stop(self, waypoint_idx):
         """Publish stop-reached event and block until confirmation or stop command."""
@@ -543,77 +614,97 @@ class RouteWaypointFollower(Node):
                     continue
                 break
 
-            self.get_logger().info(
-                f"→ Segment {seg_no}/{len(segments)}: {len(seg_poses)} pose(s) "
-                f"flowing through to waypoint index {end_orig_idx + 1}"
-                + (" [STOP at end]" if ends_at_stop else ""))
-
-            # Publish the segment's end as the web app's highlighted target.
-            twp = self.waypoints[end_orig_idx]
-            _write_nav_target(end_orig_idx, seg_no, len(segments),
-                              float(twp['latitude']), float(twp['longitude']))
-            self.navigator.goThroughPoses(seg_poses)
-
-            # --- Monitor until segment complete or command received ---
-            while not self.navigator.isTaskComplete():
-                rclpy.spin_once(self, timeout_sec=0.05)
-                cmd = _read_cmd()
-
-                if cmd == 'stop':
-                    self.navigator.cancelTask()
-                    _clear_nav_target()
-                    self.get_logger().info("Navigation stopped.")
-                    return
-
-                if cmd == 'pause':
-                    self.navigator.cancelTask()
-                    self.get_logger().info(f"Paused during segment {seg_no}")
-                    cmd = 'pause'
-                    while cmd == 'pause':
-                        rclpy.spin_once(self, timeout_sec=0.2)
-                        cmd = _read_cmd()
-                    if cmd == 'stop':
-                        _clear_nav_target()
-                        self.get_logger().info("Navigation stopped while paused.")
-                        return
-                    # Re-issue only the poses still AHEAD of the rover.
-                    #
-                    # This previously re-sent the whole segment, on the incorrect
-                    # assumption that RemovePassedGoals would drop the ones
-                    # already behind. It cannot: that node pops goals off the
-                    # FRONT only while goal[0] is within its radius and stops at
-                    # the first one that is not. Resuming at waypoint 20 of 37
-                    # puts waypoint 1 at goal[0], ~19m away — nothing is pruned,
-                    # and the rover drives all the way back to the start of the
-                    # segment. Trim here instead of relying on the BT.
-                    remaining = self._poses_ahead(seg_poses)
-                    self.get_logger().info(
-                        f"Resumed — re-issuing segment {seg_no} from the nearest "
-                        f"pose ahead ({len(remaining)}/{len(seg_poses)} poses remain)")
-                    self.navigator.goThroughPoses(remaining)
-
-            result = self.navigator.getResult()
-            # A non-SUCCEEDED result does NOT stop the run — the survey advances
-            # to the next segment. With through-poses a failure can strand EVERY
-            # point in the segment, so all of them are recorded as data gaps
-            # rather than just one.
-            if result == TaskResult.SUCCEEDED:
+            # Attempt loop. Under on_segment_failure='hold' a failed segment is
+            # retried as many times as the operator presses Run — there is no
+            # automatic retry, so the rover never re-attempts a blocked segment
+            # on its own. Under 'skip' this runs exactly once.
+            attempt = 0
+            while True:
+                attempt += 1
                 self.get_logger().info(
-                    f"Segment {seg_no}/{len(segments)} complete — result: {result}")
-            else:
-                for orig_idx, _ in segment:
-                    self._skipped.append((orig_idx, seg_no, result))
+                    f"→ Segment {seg_no}/{len(segments)}: {len(seg_poses)} pose(s) "
+                    f"flowing through to waypoint index {end_orig_idx + 1}"
+                    + (f" [attempt {attempt}]" if attempt > 1 else "")
+                    + (" [STOP at end]" if ends_at_stop else ""))
+
+                # Publish the segment's end as the web app's highlighted target.
+                twp = self.waypoints[end_orig_idx]
+                _write_nav_target(end_orig_idx, seg_no, len(segments),
+                                  float(twp['latitude']), float(twp['longitude']))
+                # A retry starts from wherever the rover actually stopped, for
+                # the same reason a resume does — see _poses_ahead.
+                dispatch = seg_poses if attempt == 1 else self._poses_ahead(seg_poses)
+                self.navigator.goThroughPoses(dispatch)
+
+                # --- Monitor until segment complete or command received ---
+                while not self.navigator.isTaskComplete():
+                    rclpy.spin_once(self, timeout_sec=0.05)
+                    cmd = _read_cmd()
+
+                    if cmd == 'stop':
+                        self.navigator.cancelTask()
+                        _clear_nav_target()
+                        self.get_logger().info("Navigation stopped.")
+                        return
+
+                    if cmd == 'pause':
+                        self.navigator.cancelTask()
+                        self.get_logger().info(f"Paused during segment {seg_no}")
+                        cmd = 'pause'
+                        while cmd == 'pause':
+                            rclpy.spin_once(self, timeout_sec=0.2)
+                            cmd = _read_cmd()
+                        if cmd == 'stop':
+                            _clear_nav_target()
+                            self.get_logger().info("Navigation stopped while paused.")
+                            return
+                        # Re-issue only the poses still AHEAD of the rover.
+                        #
+                        # This previously re-sent the whole segment, on the incorrect
+                        # assumption that RemovePassedGoals would drop the ones
+                        # already behind. It cannot: that node pops goals off the
+                        # FRONT only while goal[0] is within its radius and stops at
+                        # the first one that is not. Resuming at waypoint 20 of 37
+                        # puts waypoint 1 at goal[0], ~19m away — nothing is pruned,
+                        # and the rover drives all the way back to the start of the
+                        # segment. Trim here instead of relying on the BT.
+                        remaining = self._poses_ahead(seg_poses)
+                        self.get_logger().info(
+                            f"Resumed — re-issuing segment {seg_no} from the nearest "
+                            f"pose ahead ({len(remaining)}/{len(seg_poses)} poses remain)")
+                        self.navigator.goThroughPoses(remaining)
+
+                result = self.navigator.getResult()
+                if result == TaskResult.SUCCEEDED:
+                    self.get_logger().info(
+                        f"Segment {seg_no}/{len(segments)} complete — result: {result}")
+                    break
+
                 first_wp = self.waypoints[segment[0][0]]
                 last_wp = self.waypoints[end_orig_idx]
                 self.get_logger().error(
-                    f"!!! SEGMENT FAILED — DATA GAP !!! "
+                    f"!!! SEGMENT FAILED !!! "
                     f"segment {seg_no}/{len(segments)} covering waypoints.yaml indices "
                     f"{segment[0][0] + 1}..{end_orig_idx + 1} "
                     f"(lat {float(first_wp['latitude']):.7f}, lon {float(first_wp['longitude']):.7f}"
                     f" → lat {float(last_wp['latitude']):.7f}, lon {float(last_wp['longitude']):.7f}) "
-                    f"was NOT completed (result: {result}). Survey continues to the next "
-                    f"segment; {len(segment)} location(s) have no measurement. "
-                    f"Total skipped so far: {len(self._skipped)}")
+                    f"was NOT completed (result: {result}) on attempt {attempt}.")
+
+                if self.on_segment_failure == 'skip':
+                    # Previous behaviour: advance and log a data gap. With
+                    # through-poses a failure can strand EVERY point in the
+                    # segment, so all of them are recorded, not just one.
+                    for orig_idx, _ in segment:
+                        self._skipped.append((orig_idx, seg_no, result))
+                    self.get_logger().error(
+                        f"DATA GAP — survey continues to the next segment; "
+                        f"{len(segment)} location(s) have no measurement. "
+                        f"Total skipped so far: {len(self._skipped)}")
+                    break
+
+                if self._hold_for_operator(seg_no, len(segments), attempt, result) == 'stop':
+                    _clear_nav_target()
+                    return
 
             # --- Stop point: wait for confirmation before the next segment ---
             if ends_at_stop:

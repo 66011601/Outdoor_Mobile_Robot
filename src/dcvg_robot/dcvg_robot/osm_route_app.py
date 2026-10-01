@@ -17,6 +17,7 @@ Usage:
   Then open:  http://localhost:5000
 """
 
+import collections
 import math as _math
 import os
 import subprocess
@@ -32,6 +33,66 @@ _STOP_CONFIRM_FILE = '/tmp/dcvg_stop_confirm'
 _NAV_TARGET_FILE   = '/tmp/dcvg_nav_target'   # current goal published by route_waypoint_follower
 _nav_proc = None
 _nav_state = 'stopped'  # 'stopped' | 'running' | 'paused'
+
+# ---------------------------------------------------------------------------
+# Bringup lifecycle (launches/stops `dcvg_bringup bringup.launch.py` itself so
+# the web UI is the single entry point in the field — see the setup screen).
+# ---------------------------------------------------------------------------
+# bringup.launch.py staggers 8 TimerAction stages out to ~21-22s (Nav2 last,
+# per its own delay args) with no "I'm up" sentinel topic/log line to watch
+# for, so "success" here is deliberately shallow: the subprocess just needs to
+# still be alive once that stagger has had time to finish. Deeper health
+# checks (GPS fix, Nav2 lifecycle state, etc.) are a future upgrade.
+_BRINGUP_GRACE_S = 30.0
+_bringup = {'proc': None, 'state': 'idle', 'log': collections.deque(maxlen=200),
+            'started_ts': 0.0}
+# state: 'idle' | 'starting' | 'running' | 'failed' | 'stopped'
+
+
+def _bringup_reader(proc):
+    for line in proc.stdout:
+        _bringup['log'].append(line.rstrip('\n'))
+
+
+def _start_bringup():
+    if _bringup['proc'] is not None and _bringup['proc'].poll() is None:
+        return
+    _bringup['log'].clear()
+    proc = subprocess.Popen(['ros2', 'launch', 'dcvg_bringup', 'bringup.launch.py'],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    _bringup['proc'] = proc
+    _bringup['state'] = 'starting'
+    _bringup['started_ts'] = time.monotonic()
+    threading.Thread(target=_bringup_reader, args=(proc,), daemon=True).start()
+
+
+def _refresh_bringup_state():
+    proc = _bringup['proc']
+    if proc is None:
+        return
+    rc = proc.poll()
+    if rc is None:
+        if (_bringup['state'] == 'starting' and
+                time.monotonic() - _bringup['started_ts'] >= _BRINGUP_GRACE_S):
+            _bringup['state'] = 'running'
+    else:
+        _bringup['proc'] = None
+        if _bringup['state'] != 'stopped':
+            _bringup['state'] = 'failed'
+
+
+def _stop_bringup():
+    proc = _bringup['proc']
+    # Set 'stopped' before touching the process so _refresh_bringup_state()
+    # doesn't see the exit and report it as a crash ('failed').
+    _bringup['state'] = 'stopped'
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    _bringup['proc'] = None
 
 # ---------------------------------------------------------------------------
 # Robot pose monitoring (background ROS2 subscriber thread)
@@ -266,6 +327,21 @@ def _find_config(filename):
     return None
 
 
+def _find_shutdown_script():
+    """Locate src/system/shutdown.sh — it isn't part of any package's install
+    space, so derive the workspace root the same way _pkg_paths() does."""
+    try:
+        from ament_index_python.packages import get_package_share_directory
+        share_dir = get_package_share_directory('dcvg_robot')
+        ws_root = os.path.normpath(os.path.join(share_dir, '..', '..', '..', '..'))
+    except Exception:
+        return None
+    path = os.path.join(ws_root, 'src', 'system', 'shutdown.sh')
+    if os.path.isfile(path) and os.access(path, os.X_OK):
+        return path
+    return None
+
+
 def _save_yaml(data, filename):
     share_dir, src_dir = _pkg_paths()
     saved = []
@@ -345,6 +421,38 @@ def api_save():
         return jsonify({'error': 'Could not determine save path'}), 500
     return jsonify({'status': 'ok', 'path': saved[-1], 'count': len(wps)})
 
+
+@app.route('/api/waypoints')
+def api_waypoints():
+    """Return the route saved in waypoints.yaml, so a restarted UI can pick up
+    the route it was last working on instead of regenerating it.
+
+    This reads the same file route_waypoint_follower does, so what the map
+    shows after a Load is exactly what Start would drive. Malformed entries are
+    skipped rather than failing the whole load: a half-written waypoints.yaml
+    should still surface the points it does have, since the alternative in the
+    field is an empty map and no route at all.
+    """
+    path = _find_config('waypoints.yaml')
+    if not path:
+        return jsonify({'waypoints': []})
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+    except Exception as exc:
+        return jsonify({'error': f'Could not read waypoints.yaml: {exc}'}), 500
+
+    wps = []
+    for w in (data.get('waypoints') or []):
+        if not isinstance(w, dict):
+            continue
+        try:
+            wps.append({'latitude':  float(w['latitude']),
+                        'longitude': float(w['longitude']),
+                        'yaw':       float(w.get('yaw') or 0.0)})
+        except (KeyError, TypeError, ValueError):
+            continue
+    return jsonify({'waypoints': wps, 'path': path})
 
 
 @app.route('/api/stops')
@@ -625,6 +733,69 @@ def api_config():
 
 
 # ---------------------------------------------------------------------------
+# Bringup + system control — the web UI is the single entry point in the
+# field: it launches/stops the real-hardware stack and can shut the robot
+# down, instead of requiring a separate `ros2 launch` in another terminal.
+# ---------------------------------------------------------------------------
+
+@app.route('/api/bringup/start', methods=['POST'])
+def api_bringup_start():
+    _refresh_bringup_state()
+    if _bringup['state'] not in ('starting', 'running'):
+        _start_bringup()
+    return jsonify({'state': _bringup['state']})
+
+
+@app.route('/api/bringup/status')
+def api_bringup_status():
+    _refresh_bringup_state()
+    return jsonify({'state': _bringup['state'], 'log': '\n'.join(_bringup['log']),
+                     'grace_s': _BRINGUP_GRACE_S})
+
+
+@app.route('/api/bringup/stop', methods=['POST'])
+def api_bringup_stop():
+    _stop_bringup()
+    return jsonify({'state': _bringup['state']})
+
+
+@app.route('/api/system/sleep', methods=['POST'])
+def api_system_sleep():
+    """Stop the bringup launch only — Jetson and this web app stay up."""
+    _stop_bringup()
+    return jsonify({'state': _bringup['state']})
+
+
+@app.route('/api/system/shutdown', methods=['POST'])
+def api_system_shutdown():
+    """Full poweroff via src/system/shutdown.sh (passwordless sudo poweroff)."""
+    script = _find_shutdown_script()
+    if not script:
+        return jsonify({'error': 'shutdown.sh not found or not executable'}), 500
+    _stop_bringup()   # best-effort clean stop before the machine powers off
+    try:
+        subprocess.Popen([script])
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+    return jsonify({'status': 'ok'})
+
+
+@app.route('/api/wifi_status')
+def api_wifi_status():
+    try:
+        r = subprocess.run(['nmcli', '-t', '-f', 'active,signal,ssid', 'dev', 'wifi'],
+                            capture_output=True, text=True, timeout=2)
+        for line in r.stdout.splitlines():
+            parts = line.split(':', 2)
+            if len(parts) == 3 and parts[0] == 'yes':
+                ssid = parts[2].replace('\\:', ':')
+                return jsonify({'connected': True, 'signal': int(parts[1]), 'ssid': ssid})
+    except Exception:
+        pass
+    return jsonify({'connected': False, 'signal': None, 'ssid': None})
+
+
+# ---------------------------------------------------------------------------
 # Frontend
 # ---------------------------------------------------------------------------
 
@@ -805,9 +976,78 @@ body{font-family:system-ui,sans-serif;font-size:13px;display:flex;height:100vh;o
 #nav-alert .na-take{background:#16a085;color:#fff}
 #nav-alert .na-resume{background:#27ae60;color:#fff}
 #nav-alert .na-dismiss{background:#ecf0f1;color:#666;flex:0 0 auto;padding:9px 14px}
+
+/* ── Header status icons (WiFi + power) ── */
+.topbar-icons{display:flex;align-items:center;gap:8px;margin-top:6px}
+.wifi-badge{font-size:11px;color:#cfd8e3;display:flex;align-items:center;gap:4px;cursor:default}
+.power-btn{background:rgba(255,255,255,.12);color:#fff;border:none;border-radius:5px;width:24px;height:24px;font-size:13px;cursor:pointer;line-height:1;margin-left:auto}
+.power-btn:hover{background:rgba(231,76,60,.85)}
+
+/* ── Setup screen (bringup launch gate) ── */
+#setup-screen{display:flex;position:fixed;inset:0;z-index:9500;background:#11151a;color:#eaf0f6;flex-direction:column;align-items:center;justify-content:center;padding:20px}
+#setup-screen.hide{display:none}
+#setup-card{width:100%;max-width:460px;text-align:center}
+#setup-card h1{font-size:18px;margin-bottom:6px}
+#setup-card p.sub{font-size:12px;color:#7a8694;margin-bottom:22px}
+#setup-log{display:none;text-align:left;background:#0b0e12;border:1px solid #2a323c;border-radius:8px;padding:10px 12px;font-family:monospace;font-size:11px;color:#9fb0c3;max-height:220px;overflow-y:auto;white-space:pre-wrap;margin:8px 0 16px}
+#setup-log.show{display:block}
+#setup-status{font-size:13px;margin-bottom:10px;min-height:18px}
+#setup-progress-wrap{display:none;height:8px;background:#232b35;border-radius:4px;overflow:hidden;margin-bottom:8px}
+#setup-progress-wrap.show{display:block}
+#setup-progress-fill{height:100%;width:0%;background:linear-gradient(90deg,#2980b9,#3fa9e0);border-radius:4px;transition:width .6s linear}
+#setup-progress-fill.indeterminate{width:100%!important;background:repeating-linear-gradient(90deg,#2980b9 0 20px,#3fa9e0 20px 40px);background-size:56px 100%;animation:progress-stripe 1s linear infinite}
+#setup-progress-fill.failed{background:#c0392b;animation:none}
+@keyframes progress-stripe{from{background-position:0 0}to{background-position:56px 0}}
+#setup-elapsed{font-size:11px;color:#7a8694;margin-bottom:14px;min-height:14px}
+#setup-log-toggle{display:none;font-size:11px;color:#7a8694;cursor:pointer;text-decoration:underline;margin-bottom:2px}
+#setup-log-toggle.show{display:block}
+#setup-skip{display:block;margin-top:14px;font-size:11px;color:#7a8694;cursor:pointer;text-decoration:underline}
+#setup-fail-note{display:none;background:#2a1518;border:1px solid #c0392b;color:#f5b7b1;border-radius:6px;padding:9px 12px;font-size:12px;margin-bottom:12px;text-align:left}
+#setup-fail-note.show{display:block}
+
+/* ── Shutdown / Sleep modal ── */
+#shutdown-modal{display:none;position:fixed;inset:0;z-index:9800;background:rgba(0,0,0,.5);align-items:center;justify-content:center}
+#shutdown-modal.show{display:flex}
+#shutdown-card{background:#fff;border-radius:10px;padding:20px 22px;width:280px;box-shadow:0 8px 30px rgba(0,0,0,.35)}
+#shutdown-card h3{font-size:14px;margin-bottom:4px;color:#2c3e50}
+#shutdown-card p{font-size:11.5px;color:#888;margin-bottom:14px;line-height:1.4}
+#shutdown-card .btn{margin-bottom:8px}
+#shutdown-card .btn:last-child{margin-bottom:0}
 </style>
 </head>
 <body>
+
+<!-- ── Setup screen (gate until bringup is up) ── -->
+<div id="setup-screen">
+  <div class="topbar-icons" style="position:absolute;top:16px;right:16px">
+    <span class="wifi-badge" title="WiFi signal">📶 <span class="wb-text">—</span></span>
+    <button class="power-btn" onclick="openShutdownModal()" title="Shutdown / Sleep">⏻</button>
+  </div>
+  <div id="setup-card">
+    <h1>DCVG Rover Setup</h1>
+    <p class="sub">Launching the real-hardware navigation stack…</p>
+    <div id="setup-fail-note"></div>
+    <div id="setup-status">Not started</div>
+    <div id="setup-progress-wrap"><div id="setup-progress-fill"></div></div>
+    <div id="setup-elapsed"></div>
+    <div id="setup-log-toggle" onclick="toggleSetupLog()">Show technical log ▾</div>
+    <div id="setup-log"></div>
+    <button class="btn btn-blue" id="btn-setup-launch" onclick="startBringup()">🚀 Launch Bringup</button>
+    <button class="btn btn-orange" id="btn-setup-retry" onclick="startBringup()" style="display:none">🔁 Retry</button>
+    <span id="setup-skip" onclick="skipBringup()">Skip — bringup already running</span>
+  </div>
+</div>
+
+<!-- ── Shutdown / Sleep modal ── -->
+<div id="shutdown-modal">
+  <div id="shutdown-card">
+    <h3>Shutdown robot?</h3>
+    <p>Shutdown powers off the Jetson completely. Sleep only stops the navigation stack — the Jetson stays on so you can relaunch or shut down later.</p>
+    <button class="btn btn-red" onclick="doShutdown()">⏻ Shutdown</button>
+    <button class="btn btn-orange" id="btn-sleep" onclick="doSleep()">💤 Sleep</button>
+    <button class="btn btn-gray" onclick="closeShutdownModal()">Cancel</button>
+  </div>
+</div>
 
 <!-- ── Stall alert (robot not moving / stuck) ── -->
 <div id="nav-alert">
@@ -825,6 +1065,10 @@ body{font-family:system-ui,sans-serif;font-size:13px;display:flex;height:100vh;o
   <div id="sidebar-header">
     OSM Route Planner
     <small>Click map to add stops &rarr; Generate &rarr; Edit</small>
+    <div class="topbar-icons">
+      <span class="wifi-badge" title="WiFi signal">📶 <span class="wb-text">—</span></span>
+      <button class="power-btn" onclick="openShutdownModal()" title="Shutdown / Sleep">⏻</button>
+    </div>
   </div>
 
   <!-- ── Search bar ── -->
@@ -932,7 +1176,11 @@ body{font-family:system-ui,sans-serif;font-size:13px;display:flex;height:100vh;o
   </div><!-- sidebar-body -->
 
   <div id="sidebar-footer">
-    <button class="btn btn-blue" id="btn-gen" onclick="generateRoute()">Generate Route</button>
+    <div class="btn-row">
+      <button class="btn btn-blue" id="btn-gen" onclick="generateRoute()">Generate Route</button>
+      <button class="btn btn-gray" id="btn-load" onclick="loadSavedRoute()"
+              title="Restore the route already saved in waypoints.yaml">📂 Load Saved</button>
+    </div>
     <div style="border-top:1px solid #eee;margin:4px 0;padding-top:8px">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
         <span style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#aaa">Navigation</span>
@@ -1286,6 +1534,34 @@ async function generateRoute() {
     status('✗ ' + e.message, 'err');
   } finally {
     showSpinner(false);
+  }
+}
+
+// Restore the route from waypoints.yaml — the counterpart to the implicit save
+// that Generate / Use as Route / waypoint edits already do. Lets a restarted UI
+// get back the route it was driving without re-querying OSM.
+//
+// Note this drops the numbered stop anchors: loadWaypoints() clears stops, and
+// those anchors live only in the browser, never in waypoints.yaml. Navigation
+// still works and progress falls back to per-waypoint highlighting, the same
+// path free-draw routes already use.
+async function loadSavedRoute() {
+  try {
+    const r = await fetch('/api/waypoints');
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'Server error');
+    if (!d.waypoints || !d.waypoints.length) {
+      status('No saved route — waypoints.yaml is missing or empty.', 'err');
+      return;
+    }
+    loadWaypoints(d.waypoints);
+    document.getElementById('tab-edit').disabled = false;
+    switchTab('edit');
+    map.fitBounds(L.latLngBounds(d.waypoints.map(wp => [wp.latitude, wp.longitude])),
+                  {padding:[80,80], maxZoom:17});
+    status(`✓ Loaded ${d.waypoints.length} saved waypoints`, 'ok');
+  } catch(e) {
+    status('✗ ' + e.message, 'err');
   }
 }
 
@@ -2200,6 +2476,169 @@ setInterval(async () => {
 }, 1000);
 
 // ═══════════════════════════════════════════════════════════════════
+// Bringup setup gate
+// ═══════════════════════════════════════════════════════════════════
+let _bringupTimer     = null;
+let _bringupStartedAt = 0;
+let _bringupSkipped   = false;
+let _bringupGraceS    = 30;   // overwritten from the server's actual grace period
+let _setupLogOpen     = false;
+
+function _setupSetStatus(text) { document.getElementById('setup-status').textContent = text; }
+
+function toggleSetupLog() {
+  _setupLogOpen = !_setupLogOpen;
+  document.getElementById('setup-log').classList.toggle('show', _setupLogOpen);
+  document.getElementById('setup-log-toggle').textContent =
+    _setupLogOpen ? 'Hide technical log ▴' : 'Show technical log ▾';
+}
+
+function _setSetupProgress(pct, mode) {
+  const fill = document.getElementById('setup-progress-fill');
+  fill.classList.toggle('indeterminate', mode === 'indeterminate');
+  fill.classList.toggle('failed', mode === 'failed');
+  if (mode !== 'indeterminate') fill.style.width = `${pct}%`;
+}
+
+async function startBringup() {
+  document.getElementById('setup-fail-note').classList.remove('show');
+  document.getElementById('btn-setup-retry').style.display = 'none';
+  document.getElementById('btn-setup-launch').style.display = 'none';
+  document.getElementById('setup-progress-wrap').classList.add('show');
+  document.getElementById('setup-log-toggle').classList.add('show');
+  _setSetupProgress(0, 'normal');
+  _setupSetStatus('Launching…');
+  _bringupStartedAt = Date.now();
+  try { await fetch('/api/bringup/start', {method: 'POST'}); } catch(e) {}
+  if (_bringupTimer) clearInterval(_bringupTimer);
+  _bringupTimer = setInterval(_pollBringup, 1000);
+  _pollBringup();
+}
+
+async function _pollBringup() {
+  try {
+    const r = await fetch('/api/bringup/status');
+    const d = await r.json();
+    if (d.grace_s) _bringupGraceS = d.grace_s;
+    const logEl = document.getElementById('setup-log');
+    logEl.textContent = d.log || '';
+    logEl.scrollTop = logEl.scrollHeight;
+    const secs = Math.floor((Date.now() - _bringupStartedAt) / 1000);
+
+    if (d.state === 'running') {
+      clearInterval(_bringupTimer); _bringupTimer = null;
+      _setSetupProgress(100, 'normal');
+      document.getElementById('setup-elapsed').textContent = '';
+      _enterMainUI();
+    } else if (d.state === 'failed') {
+      clearInterval(_bringupTimer); _bringupTimer = null;
+      _setSetupProgress(100, 'failed');
+      _setupSetStatus('Bringup failed to start.');
+      document.getElementById('setup-elapsed').textContent = '';
+      document.getElementById('setup-fail-note').textContent =
+        'The launch process exited unexpectedly — check the log below, then retry.';
+      document.getElementById('setup-fail-note').classList.add('show');
+      document.getElementById('btn-setup-retry').style.display = '';
+      if (!_setupLogOpen) toggleSetupLog();
+    } else if (d.state === 'starting') {
+      if (secs < _bringupGraceS) {
+        _setSetupProgress((secs / _bringupGraceS) * 100, 'normal');
+        _setupSetStatus('Starting sensors, GPS/RTK, localization, and Nav2…');
+        document.getElementById('setup-elapsed').textContent =
+          `About ${_bringupGraceS - secs}s left…`;
+      } else {
+        _setSetupProgress(100, 'indeterminate');
+        _setupSetStatus('Almost there — finishing startup…');
+        document.getElementById('setup-elapsed').textContent =
+          `Taking a bit longer than usual (${secs}s so far)…`;
+      }
+    }
+  } catch(e) {}
+}
+
+function skipBringup() {
+  _bringupSkipped = true;
+  const sleepBtn = document.getElementById('btn-sleep');
+  sleepBtn.disabled = true;
+  sleepBtn.title = "Can't stop a bringup this app didn't launch — use Shutdown instead.";
+  _enterMainUI();
+}
+
+function _enterMainUI() {
+  document.getElementById('setup-screen').classList.add('hide');
+}
+
+function _resetSetupScreen() {
+  document.getElementById('setup-screen').classList.remove('hide');
+  document.getElementById('setup-log').classList.remove('show');
+  document.getElementById('setup-log-toggle').classList.remove('show');
+  document.getElementById('setup-progress-wrap').classList.remove('show');
+  _setupLogOpen = false;
+  document.getElementById('setup-log-toggle').textContent = 'Show technical log ▾';
+  document.getElementById('btn-setup-retry').style.display = 'none';
+  document.getElementById('btn-setup-launch').style.display = '';
+  document.getElementById('setup-fail-note').classList.remove('show');
+  _setupSetStatus('Not started');
+  document.getElementById('setup-elapsed').textContent = '';
+}
+
+// On load, check whether bringup is already up/starting before showing the
+// gate — avoids forcing a redundant relaunch after a page refresh.
+(async () => {
+  try {
+    const r = await fetch('/api/bringup/status');
+    const d = await r.json();
+    if (d.grace_s) _bringupGraceS = d.grace_s;
+    if (d.state === 'running') {
+      _enterMainUI();
+    } else if (d.state === 'starting') {
+      _bringupStartedAt = Date.now();
+      document.getElementById('setup-progress-wrap').classList.add('show');
+      document.getElementById('setup-log-toggle').classList.add('show');
+      document.getElementById('btn-setup-launch').style.display = 'none';
+      _setupSetStatus('Starting sensors, GPS/RTK, localization, and Nav2…');
+      _bringupTimer = setInterval(_pollBringup, 1000);
+      _pollBringup();
+    }
+  } catch(e) {}
+})();
+
+// ═══════════════════════════════════════════════════════════════════
+// WiFi status (robot status — signal strength for now, more to come)
+// ═══════════════════════════════════════════════════════════════════
+async function _updateWifi() {
+  try {
+    const r = await fetch('/api/wifi_status');
+    const d = await r.json();
+    document.querySelectorAll('.wifi-badge').forEach(el => {
+      el.querySelector('.wb-text').textContent = d.connected ? `${d.signal}%` : '—';
+      el.title = d.connected ? `WiFi: ${d.ssid} (${d.signal}%)` : 'WiFi: not connected';
+    });
+  } catch(e) {}
+}
+setInterval(_updateWifi, 5000);
+_updateWifi();
+
+// ═══════════════════════════════════════════════════════════════════
+// Shutdown / Sleep
+// ═══════════════════════════════════════════════════════════════════
+function openShutdownModal()  { document.getElementById('shutdown-modal').classList.add('show'); }
+function closeShutdownModal() { document.getElementById('shutdown-modal').classList.remove('show'); }
+
+async function doShutdown() {
+  document.getElementById('shutdown-card').innerHTML =
+    '<h3>Shutting down…</h3><p>The robot is powering off.</p>';
+  try { await fetch('/api/system/shutdown', {method: 'POST'}); } catch(e) {}
+}
+
+async function doSleep() {
+  if (_bringupSkipped) { closeShutdownModal(); return; }
+  closeShutdownModal();
+  try { await fetch('/api/system/sleep', {method: 'POST'}); } catch(e) {}
+  _resetSetupScreen();
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Boot: load config + center on reference
 // ═══════════════════════════════════════════════════════════════════
 (async () => {
@@ -2263,7 +2702,7 @@ setInterval(async () => {
 # ---------------------------------------------------------------------------
 
 def main():
-    port = 5000
+    port = 5010
     args = sys.argv[1:]
     if '--port' in args:
         i = args.index('--port')

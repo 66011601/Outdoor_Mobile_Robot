@@ -1,3 +1,27 @@
 confirmation_topic: /dcvg/stop_confirm
 reached_topic: /dcvg/stop_reached
-stops: []
+stops:
+- index: 1
+  latitude: 12.71868295
+  longitude: 101.15253657
+- index: 2
+  latitude: 12.71865973
+  longitude: 101.15257278
+- index: 3
+  latitude: 12.71863652
+  longitude: 101.15260899
+- index: 4
+  latitude: 12.7186133
+  longitude: 101.1526452
+- index: 5
+  latitude: 12.71863586
+  longitude: 101.15260883
+- index: 6
+  latitude: 12.71865843
+  longitude: 101.15257245
+- index: 7
+  latitude: 12.71868099
+  longitude: 101.15253607
+- index: 8
+  latitude: 12.71870356
+  longitude: 101.15249969

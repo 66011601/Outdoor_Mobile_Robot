@@ -1,0 +1,17 @@
+[Unit]
+Description=DCVG OSM Route Web App (osm_route_app)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jetson
+Environment=ROS_DOMAIN_ID=30
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /home/jetson/dcvg_robot/install/setup.bash && exec ros2 run dcvg_robot osm_route_app'
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

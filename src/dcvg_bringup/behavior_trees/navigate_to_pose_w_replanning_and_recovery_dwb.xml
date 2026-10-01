@@ -7,11 +7,12 @@
   risk here since the depth camera (no LiDAR in this build) is the only
   obstacle sensor and has a blind spot close to the robot. Backing away first
   opens space so the costmap clear + replan can route around the obstacle.
-  Recovery order per stuck event: Clear+replan -> BackUp -> Spin -> Wait.
+  Recovery order per stuck event: Clear+replan -> Wait (NON-EVASIVE; BackUp
+  and Spin removed so a stalled rover never drives itself off the route line).
 -->
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+    <RecoveryNode number_of_retries="2" name="NavigateRecovery">
       <PipelineSequence name="NavigateWithReplanning">
         <RateController hz="1.0">
           <RecoveryNode number_of_retries="1" name="ComputePathToPose">
@@ -31,8 +32,7 @@
             <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
             <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
           </Sequence>
-          <BackUp backup_dist="0.50" backup_speed="0.15"/>
-          <Spin spin_dist="1.57"/>
+          <!-- BackUp/Spin REMOVED: non-evasive recovery, see the RPP variant. -->
           <Wait wait_duration="5"/>
         </RoundRobin>
       </ReactiveFallback>

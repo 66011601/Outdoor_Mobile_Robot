@@ -65,7 +65,7 @@
 
   <!-- Depth camera (D455: 124×26×25 mm, 87° H-FOV, depth 0.6-6 m) -->
   <xacro:property name="cam_x"          value="0.52"/>
-  <xacro:property name="cam_z"          value="0.82"/>
+  <xacro:property name="cam_z"          value="0.62"/>
   <xacro:property name="cam_size_x"     value="0.026"/>
   <xacro:property name="cam_size_y"     value="0.124"/>
   <xacro:property name="cam_size_z"     value="0.025"/>
@@ -342,11 +342,57 @@
   </joint>
   <link name="camera_optical_frame_right"/>
 
-  <!-- GPS (placeholder — no visual) -->
+  <!-- GPS position antenna (big board). No visual, but the TRANSLATION here is
+       load-bearing and is NOT in the same category as gps_heading_link below.
+
+       navsat_transform_node looks up base_link -> <frame_id of /gps/fix> (that
+       frame_id is `gps_link`, set in config/ublox_f9p.yaml) and uses it to move
+       each fix from the ANTENNA to the robot origin. If the lookup fails it logs
+       "Will assume navsat device is mounted at robot's origin" once and carries
+       on — and an identity transform here is indistinguishable from that, so the
+       failure is silent either way.
+
+       Leaving this at 0 0 0 means the rover centres its ANTENNA on the surveyed
+       line instead of its chassis. A LATERAL antenna offset becomes a constant
+       cross-track bias of exactly that size — spend 0.2m here and a fifth of the
+       50cm corridor budget is gone before any controller tuning applies. A
+       longitudinal offset biases every stop position instead, and during a pivot
+       an offset antenna sweeps an arc that the EKF reads as real translation.
+
+       MEASURED ON THE ROBOT (2026-09-14). The simpleRTK2B Heading kit's two
+       antennas sit on the robot's centreline: HEADING antenna at the front,
+       POSITION antenna at the REAR. The position antenna is the one that
+       produces /gps/fix, so it is the one that matters here — and it is 0.60 m
+       BEHIND base_link (hence negative X, +X is forward) and 1.00 m above the
+       ground, which is 1.00 - base_height(0.08) = 0.92 m above base_link.
+
+       WHY 0.60 m MATTERS SO MUCH. With this left at zero the rover was putting
+       its ANTENNA where the chassis should be:
+         - driving straight: every measurement stop overshot by 0.60 m, because
+           the rover kept going until the rear antenna reached the waypoint;
+         - rotating in place: the antenna swings on a 0.60 m arm, so the EKF sees
+           a position jump of 2 x 0.60 x sin(theta/2) that never happened —
+           0.21 m for a 20 deg pivot, 0.85 m for 90 deg, i.e. larger than the
+           whole 0.5 m route corridor. The lateral part of that, 0.60 sin(theta),
+           is injected straight into cross-track error.
+       That is the "forward is fine, rotation loses the route" signature exactly.
+
+       gps_y is 0.0 because the antenna is on the centreline. If it is actually
+       off to one side, that offset becomes a CONSTANT cross-track bias of the
+       same size — measure it rather than assuming.
+
+       CAVEAT, not fixable here: both EKFs run two_d_mode: true, so roll/pitch
+       are forced to zero and navsat_transform's lever-arm correction assumes the
+       robot is level. A 1.0 m mast tilting 5 deg over a bump swings the antenna
+       ~0.09 m horizontally, uncompensated. Secondary next to the 0.60 m above,
+       but it is the reason a tall mast costs accuracy on rough ground. -->
+  <xacro:property name="gps_x"          value="-0.60"/>  <!-- rear-mounted: 0.60 m behind base_link -->
+  <xacro:property name="gps_y"          value="0.0"/>    <!-- on the centreline — verify -->
+  <xacro:property name="gps_z"          value="0.92"/>   <!-- 1.00 m above ground - 0.08 base_height -->
   <joint name="gps_joint" type="fixed">
     <parent link="base_link"/>
     <child link="gps_link"/>
-    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <origin xyz="${gps_x} ${gps_y} ${gps_z}" rpy="0 0 0"/>
   </joint>
   <link name="gps_link"/>
 
@@ -356,11 +402,41 @@
        already corrects for the real antenna-mounting misalignment before
        publishing yaw, so this frame only needs to RESOLVE (so robot_localization's
        TF lookup for the /gps/heading/imu orientation fusion succeeds) — modeling
-       the real physical baseline offset between the two antennas isn't needed. -->
+       the real physical baseline offset between the two antennas isn't needed.
+       Unlike gps_link above, only this frame's ROTATION is ever used, and it is
+       already aligned with base_link — the translation genuinely does not matter.
+
+       KNOWN MOUNTING (2026-09-14) — this antenna is at the FRONT, the position
+       antenna at the REAR, both on the centreline. NAV-RELPOSNED reports the
+       base -> rover vector, and in this kit the position board is the moving BASE
+       (launch arg gps_device -> /dev/ttyGPS_movingbase) while this heading board
+       is the ROVER (gps_heading_device -> /dev/ttyGPS_rover). So the reported
+       baseline runs rear -> front, which IS base_link's +X axis — meaning
+       heading_offset_deg should be 0.0, and bringup.launch.py's default is
+       already correct. Still worth confirming once against a known bearing
+       before trusting it, but there is no longer a reason to expect a 90 or 180
+       deg mounting offset. -->
+  <!-- Now modelled at its real position (front, +0.60 m X, 1.00 m above ground =
+       0.92 m above base_link) rather than left at identity. This is DOCUMENTATION,
+       not a functional fix, and the distinction matters: /gps/heading/imu is a
+       sensor_msgs/Imu whose only fused field is absolute yaw (imu1_config in
+       dual_ekf_navsat_params.yaml enables index 5 and nothing else), and
+       robot_localization uses only the ROTATION of this frame's transform to
+       rotate that yaw into base_link. The translation is never read — linear
+       acceleration, the one field a lever arm would affect, is published with
+       covariance[0] = -1 (REP-145 "not populated"). So unlike gps_link above,
+       getting this wrong cost nothing and getting it right fixes nothing; it is
+       here so the URDF is an honest record of the robot.
+       The rotation stays identity, which is correct: the antenna baseline runs
+       along +X, and any residual misalignment is gps_heading_to_imu.py's
+       heading_offset_deg to correct, not this frame's. -->
+  <xacro:property name="gps_heading_x"  value="0.60"/>   <!-- front-mounted: 0.60 m ahead of base_link -->
+  <xacro:property name="gps_heading_y"  value="0.0"/>    <!-- on the centreline — verify -->
+  <xacro:property name="gps_heading_z"  value="0.92"/>   <!-- 1.00 m above ground - 0.08 base_height -->
   <joint name="gps_heading_joint" type="fixed">
     <parent link="base_link"/>
     <child link="gps_heading_link"/>
-    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <origin xyz="${gps_heading_x} ${gps_heading_y} ${gps_heading_z}" rpy="0 0 0"/>
   </joint>
   <link name="gps_heading_link"/>
 

@@ -204,6 +204,17 @@ ekf_filter_node_map:
 navsat_transform:
   ros__parameters:
     frequency: 30.0
+    # Stated explicitly even though it is the default, because the two EKFs above
+    # use base_footprint and the difference matters here for a different reason
+    # than it does there. navsat_transform looks up THIS frame -> the frame_id on
+    # /gps/fix (`gps_link`, see ublox_f9p.yaml) to subtract the antenna lever arm
+    # from every fix. gps_link's joint is parented to base_link in the xacro, so
+    # naming base_link keeps the lookup a single direct joint. If the lookup ever
+    # fails, robot_localization does not error — it logs "Will assume navsat
+    # device is mounted at robot's origin" once and silently drops the lever-arm
+    # correction, which shows up as a constant cross-track bias, not as a fault.
+    # Grep the startup log for that string.
+    base_link_frame_id: base_link
     delay: 3.0
     magnetic_declination_radians: 0.0
     yaw_offset: 0.0

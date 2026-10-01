@@ -1,6 +1,12 @@
 
 <!--
   DCVG custom recovery BT (navigate_to_pose).
+  SUPERSEDED: recovery is now NON-EVASIVE — BackUp and Spin are gone and the
+  only remaining action that touches the motors is nothing at all (clear the
+  costmaps, then wait). The note below describes the previous BackUp-before-Spin
+  ordering and is kept for history; see the RecoveryActions comment inline and
+  the navigate_through_poses variant for why evasive recovery was dropped.
+
   Differs from the Nav2 default only in the recovery RoundRobin order:
   the rover BACKS UP before it spins. Spinning in place while wedged against
   an obstacle scrapes/pivots into it and throws controller errors — a bigger
@@ -11,7 +17,7 @@
 -->
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+    <RecoveryNode number_of_retries="2" name="NavigateRecovery">
       <PipelineSequence name="NavigateWithReplanning">
         <!-- Raised from 1.0 Hz (each tick costs one NavFn solve over the
              global costmap; re-check planner_server CPU after changing). -->
@@ -49,8 +55,13 @@
             <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
             <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
           </Sequence>
-          <BackUp backup_dist="0.50" backup_speed="0.15"/>
-          <Spin spin_dist="1.57"/>
+          <!-- BackUp and Spin REMOVED — see the navigate_through_poses variant
+               for the full rationale. Short version: on a live-road survey an
+               evasive recovery that drives the rover off the route line is a
+               worse hazard than the stall it recovers from, and there is no
+               rear-facing sensor at all on this build. Clearing the costmaps
+               handles the real common case (stale depth marks from grass);
+               anything it does not handle should stop for the operator. -->
           <Wait wait_duration="5"/>
         </RoundRobin>
       </ReactiveFallback>
