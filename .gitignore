@@ -1,22 +1,8 @@
-# Colcon build artifacts
 build/
 install/
 log/
-cache/
-
-# Zip archives
-*.zip
-
-# Python cache
 __pycache__/
 *.py[cod]
 *.egg-info/
-
-# OS
-.DS_Store
 *.db3
 *.mcap
-src/my_route/
-build/
-install/
-log/

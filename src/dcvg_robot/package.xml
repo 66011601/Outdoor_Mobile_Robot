@@ -2,26 +2,22 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>dcvg_robot</name>
-  <version>0.0.0</version>
-  <description>DCVG diff-drive robot controller nodes</description>
+  <version>1.0.0</version>
+  <description>DCVG rover robot description, route planning web app and waypoint follower</description>
   <maintainer email="66011601@kmitl.ac.th">thana</maintainer>
-  <license>TODO: License declaration</license>
+  <license>Proprietary</license>
 
-  <depend>rclpy</depend>
-  <depend>geometry_msgs</depend>
-  <depend>nav_msgs</depend>
-  <depend>sensor_msgs</depend>
-  <depend>std_msgs</depend>
-  <depend>tf2_ros</depend>
-  <depend>tf2_geometry_msgs</depend>
-  <depend>nav2_msgs</depend>
-  <depend>navigation2</depend>
-  <depend>robot_localization</depend>
-
-  <test_depend>ament_copyright</test_depend>
-  <test_depend>ament_flake8</test_depend>
-  <test_depend>ament_pep257</test_depend>
-  <test_depend>python3-pytest</test_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>nav2_simple_commander</exec_depend>
+  <exec_depend>robot_localization</exec_depend>
+  <exec_depend>python3-flask</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
 
   <export>
     <build_type>ament_python</build_type>

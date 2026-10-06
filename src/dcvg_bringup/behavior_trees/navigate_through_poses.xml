@@ -1,12 +1,3 @@
-
-<!--
-  DCVG custom recovery BT (navigate_through_poses).
-  Same change as the navigate_to_pose variant: the rover BACKS UP before it
-  spins during recovery, so it pulls away from depth-camera-only obstacles
-  instead of grinding/pivoting into them.
-  Recovery order per stuck event: Clear+replan -> Wait (NON-EVASIVE; BackUp
-  and Spin removed so a stalled rover never drives itself off the route line).
--->
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
     <RecoveryNode number_of_retries="2" name="NavigateRecovery">
@@ -14,17 +5,18 @@
         <RateController hz="1.5">
           <RecoveryNode number_of_retries="1" name="ComputePathThroughPoses">
             <ReactiveSequence>
-              <!-- radius 0.7 -> 1.5, matched to the RPP variant: this is a route-geometry
-                   property, not a controller property, so leaving the A/B arms
-                   different would confound the comparison. -->
               <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="0.8"/>
               <ComputePathThroughPoses goals="{goals}" path="{path}" planner_id="GridBased"/>
+              <Fallback name="SmoothOrPassThrough">
+                <SmoothPath unsmoothed_path="{path}" smoothed_path="{path}" smoother_id="simple_smoother"/>
+                <AlwaysSuccess/>
+              </Fallback>
             </ReactiveSequence>
             <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
           </RecoveryNode>
         </RateController>
         <RecoveryNode number_of_retries="1" name="FollowPath">
-          <FollowPath path="{path}" controller_id="FollowPath_DWB"/>
+          <FollowPath path="{path}" controller_id="FollowPath"/>
           <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
         </RecoveryNode>
       </PipelineSequence>
@@ -35,7 +27,6 @@
             <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
             <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
           </Sequence>
-          <!-- BackUp/Spin REMOVED: non-evasive recovery, see the RPP variant. -->
           <Wait wait_duration="5"/>
         </RoundRobin>
       </ReactiveFallback>

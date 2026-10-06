@@ -1,29 +1,3 @@
-# Architecture
-#   ekf_local  (world=odom): VIO velocity + camera-gyro yaw (rate+absolute) +
-#                            GPS moving-baseline heading (absolute, accurate) →
-#                            smooth AND accurate local frame
-#   ekf_global (world=map):  GPS position + GPS velocity + camera-gyro yaw
-#                            RATE ONLY (not absolute) → zero-drift global frame
-#
-# GPS does not drift — each fix is an independent absolute reading.
-# VIO drifts — small per-frame errors compound over distance.
-# Mixing VIO into ekf_global contaminates the GPS-accurate global frame with drift.
-# Keeping VIO in ekf_local only gives you smooth interpolation between GPS updates
-# while the global frame stays GPS-anchored with zero cumulative error.
-#
-# Yaw is split differently than position, and for a specific, root-caused reason
-# (see the imu0 comment in ekf_filter_node_map below): fusing a continuously-
-# updating ABSOLUTE yaw source into ekf_global creates a feedback loop through
-# the map->odom transform it both publishes and uses to interpret its own
-# position corrections. This has nothing to do with sensor accuracy — it
-# happened with GPS heading AND with camera-gyro, both diverged. So the
-# accurate absolute yaw source (GPS moving-baseline heading) lives in
-# ekf_local instead (safe there — that EKF's odom0 never self-references),
-# and ekf_global gets only camera-gyro angular VELOCITY, which satisfies
-# robot_localization's own requirement that yaw or its velocity be observed
-# without ever touching the risky path. osm_route_app reads /odometry/local,
-# not /odometry/global, for its displayed heading because of this split.
-
 ekf_filter_node_odom:
   ros__parameters:
     frequency: 30.0
@@ -32,18 +6,6 @@ ekf_filter_node_odom:
     debug: false
     publish_tf: true
 
-    # Delayed-measurement handling. Every absolute source on this robot arrives
-    # LATE relative to when it was actually measured: RTAB-Map's /vo lags by the
-    # image pipeline, and the GPS moving-baseline heading lags by the RTK solve
-    # plus serial plus driver. Without these two, robot_localization fuses each
-    # late measurement as if it described the CURRENT state, which drags the
-    # estimate back toward where the robot was a moment ago — visible on the
-    # operator map as the model rotating slower than the real robot.
-    # With them, the filter keeps a state history, rewinds to the measurement's
-    # own timestamp, fuses there, and replays forward. That only works for
-    # HONESTLY timestamped messages, which is why gps_heading_to_imu's
-    # heading_latency_s exists — a message stamped now() has no lag to recover.
-    # 1.0s of history comfortably covers both sensors' delay at 30Hz.
     smooth_lagged_data: true
     history_length: 1.0
 
@@ -52,9 +14,6 @@ ekf_filter_node_odom:
     base_link_frame: base_footprint
     world_frame: odom
 
-    # VIO velocity only — keeps odom frame smooth and high-frequency.
-    # Drift in the odom frame is expected and acceptable; Nav2 navigates in
-    # the map frame (ekf_global) which is GPS-accurate and drift-free.
     odom0: vo
     odom0_config: [false, false, false,
                   false, false, false,
@@ -64,7 +23,7 @@ ekf_filter_node_odom:
     odom0_queue_size: 10
     odom0_differential: false
     odom0_relative: false
-    
+
     imu0: imu/data_throttled
     imu0_config: [false, false, false,
                   false, false, false,
@@ -113,18 +72,6 @@ ekf_filter_node_map:
     debug: false
     publish_tf: true
 
-    # Delayed-measurement handling. Every absolute source on this robot arrives
-    # LATE relative to when it was actually measured: RTAB-Map's /vo lags by the
-    # image pipeline, and the GPS moving-baseline heading lags by the RTK solve
-    # plus serial plus driver. Without these two, robot_localization fuses each
-    # late measurement as if it described the CURRENT state, which drags the
-    # estimate back toward where the robot was a moment ago — visible on the
-    # operator map as the model rotating slower than the real robot.
-    # With them, the filter keeps a state history, rewinds to the measurement's
-    # own timestamp, fuses there, and replays forward. That only works for
-    # HONESTLY timestamped messages, which is why gps_heading_to_imu's
-    # heading_latency_s exists — a message stamped now() has no lag to recover.
-    # 1.0s of history comfortably covers both sensors' delay at 30Hz.
     smooth_lagged_data: true
     history_length: 1.0
 
@@ -142,24 +89,6 @@ ekf_filter_node_map:
     odom0_queue_size: 10
     odom0_differential: false
     odom0_relative: false
-
-    # odom1: vo
-    # odom1_config: [false,  false,  false,
-    #               false, false, false,
-    #               true, true, true,
-    #               false, false, true,
-    #               false, false, false]
-    # odom1_queue_size: 10
-    # odom1_differential: false
-    # odom1_relative: false
-
-    # twist0: vo
-    # twist0: [false, false, false,
-    #         false, false, false,
-    #         true,  true,  true,
-    #         false, false, true,
-    #         false, false, false]
-    # twist0_queue_size: 10
 
     imu0: imu/data_throttled
     imu0_config: [false, false, false,
@@ -204,16 +133,6 @@ ekf_filter_node_map:
 navsat_transform:
   ros__parameters:
     frequency: 30.0
-    # Stated explicitly even though it is the default, because the two EKFs above
-    # use base_footprint and the difference matters here for a different reason
-    # than it does there. navsat_transform looks up THIS frame -> the frame_id on
-    # /gps/fix (`gps_link`, see ublox_f9p.yaml) to subtract the antenna lever arm
-    # from every fix. gps_link's joint is parented to base_link in the xacro, so
-    # naming base_link keeps the lookup a single direct joint. If the lookup ever
-    # fails, robot_localization does not error — it logs "Will assume navsat
-    # device is mounted at robot's origin" once and silently drops the lever-arm
-    # correction, which shows up as a constant cross-track bias, not as a fault.
-    # Grep the startup log for that string.
     base_link_frame_id: base_link
     delay: 3.0
     magnetic_declination_radians: 0.0

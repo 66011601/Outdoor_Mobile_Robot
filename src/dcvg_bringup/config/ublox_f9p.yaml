@@ -1,38 +1,16 @@
-# ublox_f9p.yaml  (REAL HARDWARE)
-#
-# Config for the POSITION/BASE board of the simpleRTK2B Heading kit (the big
-# board, u-blox ZED-F9P) over native USB. This is the board that gets RTK
-# corrections from NTRIP and publishes the absolute fix (/gps/fix, /gps/vel).
-# It also relays moving-base corrections to the heading board over the
-# boards' own UART link — that link is internal to the kit, not the host.
-# Loaded by ublox_gps.launch.py; `device` is overridden from that launch's
-# `device` argument. The heading (small) board uses ublox_f9p_heading.yaml.
-#
-# config_on_startup is deliberately false: the driver will NOT push any config
-# to the receiver on startup. Rates, moving-baseline setup, and
-# CFG-USBINPROT-RTCM3X are configured once in u-center and left there — this
-# avoids the driver silently clobbering that setup on every launch.
-#
-# TBD: verify exact parameter names/values against the installed
-# ros-humble-ublox-gps release once hardware is connected — this is a
-# starting template, not a confirmed-working config.
 ublox_gps_node:
   ros__parameters:
-    device: /dev/ttyGPS_movingbase   # overridden by the `device` launch arg
-    frame_id: gps_link     # matches ntrip_bridge's Sentence.header.frame_id
+    device: /dev/ttyGPS_movingbase
+    frame_id: gps_link
 
-    config_on_startup: false   # read-only — see note above
+    config_on_startup: false
 
-    dynamic_model: portable    # TBD — portable/automotive/sea, pick to match mounting
+    dynamic_model: portable
     fix_mode: auto
-    dgnss_mode: 3               # 2 = RTK float only, 3 = allow RTK fixed
+    dgnss_mode: 3
     sbas: false
     enable_ppp: false
 
-    # Only enable the UBX messages the bringup stack actually consumes:
-    #   NAV-PVT      → fix / fix_velocity → remapped to /gps/fix, /gps/vel
-    #   NAV-RELPOSNED → moving-baseline heading, relayed from the heading board;
-    #                   consumed downstream by gps_heading_to_imu → ekf_global
     publish:
       all: false
       nav:
