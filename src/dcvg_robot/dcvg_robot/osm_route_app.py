@@ -1,5 +1,6 @@
 import collections
 import math
+import re
 import os
 import subprocess
 import sys
@@ -13,7 +14,9 @@ from ament_index_python.packages import get_package_share_directory
 from flask import Flask, Response, jsonify, request
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Image, NavSatFix
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import CameraInfo, Image, Imu, NavSatFix
+from std_msgs.msg import String
 
 from dcvg_robot.common import (NAV_TARGET_FILE, STOP_CONFIRM_FILE, STOP_STATUS_FILE,
                                haversine_distance, read_file, remove_file, write_cmd,
@@ -29,6 +32,33 @@ STALL_ANG = 0.05
 STALL_TIMEOUT_S = 7.0
 STALL_GRACE_S = 6.0
 WAYPOINT_SANITY_RADIUS_M = 2000.0
+CHECK_FRESH_S = 3.0
+CHECK_NO_DATA_S = 20.0
+LAUNCH_PROC_RE = re.compile(
+    r'\[(?:INFO|ERROR)\] \[(.+)-\d+\]: process (started|has died|has finished)')
+NAV2_PROCS = ['controller_server', 'smoother_server', 'planner_server', 'behavior_server',
+              'bt_navigator', 'waypoint_follower', 'velocity_smoother', 'lifecycle_manager']
+BRINGUP_CHECKS = [
+    {'key': 'model', 'label': 'Robot model', 'procs': ['robot_state_publisher']},
+    {'key': 'camera', 'label': 'Camera', 'procs': ['realsense2_camera_node'],
+     'topic': '/camera/color/camera_info'},
+    {'key': 'imu', 'label': 'Camera IMU', 'procs': ['imu_filter_madgwick_node', 'imu_throttle'],
+     'topic': '/imu/data_throttled'},
+    {'key': 'motors', 'label': 'Motor controller', 'procs': ['low_level_command'],
+     'topic': '/teensy/feedback'},
+    {'key': 'vo', 'label': 'Visual odometry', 'procs': ['stereo_odometry', 'rgbd_odometry',
+                                                        'obstacles_detection'], 'topic': '/vo'},
+    {'key': 'localization', 'label': 'Localization',
+     'procs': ['ekf_node', 'navsat_transform_node'], 'topic': '/odometry/local'},
+    {'key': 'gps', 'label': 'GPS position', 'procs': ['ublox_gps_node'], 'topic': '/gps/fix'},
+    {'key': 'heading', 'label': 'GPS heading', 'procs': ['gps_heading_to_imu'],
+     'topic': '/gps/heading/imu'},
+    {'key': 'ntrip', 'label': 'NTRIP corrections', 'procs': ['ntrip_ros.py', 'ntrip_bridge'],
+     'topic': '/rtcm'},
+    {'key': 'nav2', 'label': 'Navigation', 'procs': NAV2_PROCS,
+     'ready_log': 'Managed nodes are active'},
+    {'key': 'telemetry', 'label': 'Telemetry server', 'procs': ['teensy_feedback_server']},
+]
 
 SHARE_DIR = get_package_share_directory('dcvg_robot')
 SRC_CONFIG_DIR = os.path.normpath(
@@ -39,7 +69,10 @@ with open(os.path.join(SHARE_DIR, 'web', 'index.html')) as f:
 app = Flask(__name__)
 
 nav = {'proc': None, 'state': 'stopped'}
-bringup = {'proc': None, 'state': 'idle', 'log': collections.deque(maxlen=200), 'started_ts': 0.0}
+bringup = {'proc': None, 'state': 'idle', 'log': collections.deque(maxlen=200), 'started_ts': 0.0,
+           'procs': {}, 'ready_logs': set()}
+topic_seen = {}
+gps_fix = {'status': None}
 robot_pose = {'available': False, 'lat': 0.0, 'lon': 0.0, 'heading': 0.0, 'lin': 0.0, 'ang': 0.0}
 camera = {'jpeg': None, 'ts': 0.0, 'want_ts': 0.0, 'topic': DEFAULT_CAMERA_TOPIC}
 teleop = {'active': False, 'lin': 0.0, 'ang': 0.0, 'ts': 0.0, 'disengage_at': 0.0}
@@ -80,15 +113,70 @@ def start_bringup():
     if bringup['proc'] is not None and bringup['proc'].poll() is None:
         return
     bringup['log'].clear()
+    bringup['procs'].clear()
+    bringup['ready_logs'].clear()
+    topic_seen.clear()
+    gps_fix['status'] = None
     proc = subprocess.Popen(['ros2', 'launch', 'dcvg_bringup', 'bringup.launch.py'],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     bringup.update(proc=proc, state='starting', started_ts=time.monotonic())
 
     def reader():
         for line in proc.stdout:
-            bringup['log'].append(line.rstrip('\n'))
+            line = line.rstrip('\n')
+            bringup['log'].append(line)
+            parse_launch_line(line)
 
     threading.Thread(target=reader, daemon=True).start()
+
+
+def parse_launch_line(line):
+    m = LAUNCH_PROC_RE.search(line)
+    if m:
+        name, event = m.group(1), m.group(2)
+        if event == 'started':
+            bringup['procs'].setdefault(name, {'died': 0, 'since': time.monotonic()})
+        elif name in bringup['procs']:
+            bringup['procs'][name]['died'] += 1
+        return
+    for c in BRINGUP_CHECKS:
+        if c.get('ready_log') and c['ready_log'] in line:
+            bringup['ready_logs'].add(c['key'])
+
+
+def evaluate_check(c, now):
+    procs = [bringup['procs'][p] for p in c['procs'] if p in bringup['procs']]
+    if any(p['died'] for p in procs):
+        return 'error', 'Process stopped — see technical log'
+    if not procs:
+        return 'pending', 'Waiting'
+    since = min(p['since'] for p in procs)
+    topic = c.get('topic')
+    if topic:
+        if now - topic_seen.get(topic, -1e9) > CHECK_FRESH_S:
+            if now - since > CHECK_NO_DATA_S:
+                return 'warn', f'No data on {topic}'
+            return 'starting', 'Starting'
+        if c['key'] == 'gps':
+            status = gps_fix['status']
+            if status is None or status < 0:
+                return 'warn', 'No fix yet'
+            return 'ok', 'RTK fix' if status >= 2 else 'Fix (no RTK)'
+        return 'ok', 'OK'
+    if c.get('ready_log') and c['key'] not in bringup['ready_logs']:
+        return 'starting', 'Starting'
+    return 'ok', 'OK'
+
+
+def bringup_checks():
+    if bringup['state'] in ('idle', 'stopped'):
+        return []
+    now = time.monotonic()
+    out = []
+    for c in BRINGUP_CHECKS:
+        state, detail = evaluate_check(c, now)
+        out.append({'key': c['key'], 'label': c['label'], 'state': state, 'detail': detail})
+    return out
 
 
 def refresh_bringup_state():
@@ -197,11 +285,31 @@ def ros_monitor():
         node.declare_parameter('camera_topic', DEFAULT_CAMERA_TOPIC)
         camera['topic'] = str(node.get_parameter('camera_topic').value)
 
+        def seen(topic):
+            def cb(_msg):
+                topic_seen[topic] = time.monotonic()
+            return cb
+
+        for msg_type, topic in ((CameraInfo, '/camera/color/camera_info'),
+                                (Imu, '/imu/data_throttled'),
+                                (String, '/teensy/feedback'),
+                                (Odometry, '/vo'),
+                                (Imu, '/gps/heading/imu')):
+            node.create_subscription(msg_type, topic, seen(topic), qos_profile_sensor_data)
+        try:
+            from rtcm_msgs.msg import Message as RtcmMessage
+            node.create_subscription(RtcmMessage, '/rtcm', seen('/rtcm'), 10)
+        except Exception as exc:
+            print(f'[osm_route_app] RTCM check disabled: {exc}')
+
         def gps_cb(msg):
+            topic_seen['/gps/fix'] = time.monotonic()
+            gps_fix['status'] = msg.status.status
             if msg.status.status >= 0:
                 robot_pose.update(lat=msg.latitude, lon=msg.longitude, available=True)
 
         def odom_cb(msg):
+            topic_seen['/odometry/local'] = time.monotonic()
             q = msg.pose.pose.orientation
             robot_pose['heading'] = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
                                                1.0 - 2.0 * (q.y * q.y + q.z * q.z))
@@ -482,7 +590,7 @@ def api_bringup_start():
 def api_bringup_status():
     refresh_bringup_state()
     return jsonify({'state': bringup['state'], 'log': '\n'.join(bringup['log']),
-                    'grace_s': BRINGUP_GRACE_S})
+                    'grace_s': BRINGUP_GRACE_S, 'checks': bringup_checks()})
 
 
 @app.route('/api/bringup/stop', methods=['POST'])

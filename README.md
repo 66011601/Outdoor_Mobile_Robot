@@ -58,7 +58,30 @@ source install/setup.bash
 ros2 run dcvg_robot osm_route_app          # open http://<jetson-ip>:5010
 ```
 
-The web app is the normal entry point. It first asks for a mode. **Manual** stops any running bringup and navigation, then starts `dcvg.service` (the legacy manual-control program in `~/Desktop/DCVG_Robot`), and the page offers only **Shutdown** and **Switch to Auto**. **Auto** stops `dcvg.service` and shows the bringup screen. The two modes are mutually exclusive because both open `/dev/ttyTeensy` and TCP 5005. Switching modes runs `sudo -n systemctl start|stop dcvg.service`, so it needs a NOPASSWD sudoers rule for exactly those two commands. Set the `DCVG_PORT` environment variable to change the port (default 5010). **Launch Bringup** runs `ros2 launch dcvg_bringup bringup.launch.py`. Then you plan a route, add stops, and press **Start**, which runs `route_waypoint_follower`.
+The web app is the normal entry point. It first asks for a mode. **Manual** stops any running bringup and navigation, then starts `dcvg.service` (the legacy manual-control program in `~/Desktop/DCVG_Robot`), and the page offers only **Shutdown** and **Switch to Auto**. **Auto** stops `dcvg.service` and shows the bringup screen. The two modes are mutually exclusive because both open `/dev/ttyTeensy` and TCP 5005. Switching modes runs `sudo -n systemctl start|stop dcvg.service`, so it needs a NOPASSWD sudoers rule for exactly those two commands. Set the `DCVG_PORT` environment variable to change the port (default 5010). **Launch Bringup** runs `ros2 launch dcvg_bringup bringup.launch.py`.
+
+While bringup starts, the setup screen shows a checklist instead of the raw launch output, which is still available under "Show technical log". The checks are defined in `BRINGUP_CHECKS` in `osm_route_app.py`. Each check combines two sources:
+
+- Launch log lines `process started` and `process has died/finished` for the check's executables. Any exit marks the check as an error.
+- For most checks, data arriving on a topic within the last 3 s. If a process has run for 20 s without data, the check shows a warning.
+
+| Check | Executables | Ready when |
+|---|---|---|
+| Robot model | robot_state_publisher | process started |
+| Camera | realsense2_camera_node | `/camera/color/camera_info` |
+| Camera IMU | imu_filter_madgwick_node, imu_throttle | `/imu/data_throttled` |
+| Motor controller | low_level_command | `/teensy/feedback` |
+| Visual odometry | stereo/rgbd_odometry, obstacles_detection | `/vo` |
+| Localization | ekf_node, navsat_transform_node | `/odometry/local` |
+| GPS position | ublox_gps_node | `/gps/fix` with a fix (status 2 is shown as RTK) |
+| GPS heading | gps_heading_to_imu | `/gps/heading/imu` |
+| NTRIP corrections | ntrip_ros.py, ntrip_bridge | `/rtcm` |
+| Navigation | Nav2 servers, lifecycle_manager | log line `Managed nodes are active` |
+| Telemetry server | teensy_feedback_server | process started |
+
+After the grace period, the UI opens automatically if every check is OK. Otherwise it offers **Continue anyway**. When you add a node to the launch files, add it to `BRINGUP_CHECKS` too.
+
+Then you plan a route, add stops, and press **Start**, which runs `route_waypoint_follower`.
 
 To run the stack without the UI:
 

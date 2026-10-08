@@ -1,19 +1,13 @@
 stops:
 - index: 1
-  latitude: 12.71868022
-  longitude: 101.15255132
+  latitude: 12.70057276
+  longitude: 101.19592985
 - index: 2
-  latitude: 12.7186582
-  longitude: 101.15259089
+  latitude: 12.70055526
+  longitude: 101.19592968
 - index: 3
-  latitude: 12.71863618
-  longitude: 101.15263045
+  latitude: 12.70053777
+  longitude: 101.19592952
 - index: 4
-  latitude: 12.71865888
-  longitude: 101.15259106
-- index: 5
-  latitude: 12.71868158
-  longitude: 101.15255167
-- index: 6
-  latitude: 12.71870427
-  longitude: 101.15251229
+  latitude: 12.70052027
+  longitude: 101.19592935
