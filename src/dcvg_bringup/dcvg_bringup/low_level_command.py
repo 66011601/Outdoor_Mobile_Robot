@@ -7,6 +7,7 @@ from std_msgs.msg import String
 
 MAX_RX_LINE_BYTES = 1024
 READ_PERIOD_S = 0.05
+RECONNECT_PERIOD_S = 0.5
 
 
 def seconds(duration):
@@ -25,7 +26,7 @@ class LowLevelCommand(Node):
         self.declare_parameter('cmd_timeout', 0.5)
         self.declare_parameter('startup_hold', 2.0)
         self.declare_parameter('probe_settle_delay', 2.0)
-        self.declare_parameter('probe_down_delay', 8.0)
+        self.declare_parameter('probe_down_delay', 2.5)
         self.declare_parameter('probe_raise_delay', 3.0)
         self.declare_parameter('auto_confirm', True)
         p = lambda name: self.get_parameter(name).value
@@ -39,14 +40,10 @@ class LowLevelCommand(Node):
         self.probe_raise_delay = float(p('probe_raise_delay'))
         self.auto_confirm = bool(p('auto_confirm'))
 
-        port = p('port')
-        self.ser = serial.Serial(port, int(p('baud')), timeout=0.1, write_timeout=0.1)
-        try:
-            self.ser.reset_output_buffer()
-            self.ser.reset_input_buffer()
-        except (serial.SerialException, OSError) as exc:
-            self.get_logger().warn(f'Could not flush serial buffers: {exc}')
-        self.get_logger().info(f'Teensy serial open on {port}')
+        self.port = p('port')
+        self.baud = int(p('baud'))
+        self.ser = None
+        self.open_serial()
 
         self.armed = False
         self.stopped = True
@@ -56,6 +53,7 @@ class LowLevelCommand(Node):
         self.probe_up = 0
         self.probe_down = 0
         self.probe_timer = None
+        self.probe_link_ok = True
         self.rx_buf = bytearray()
         self.seen_feedback = False
         self.send(0.0, 0.0)
@@ -66,6 +64,7 @@ class LowLevelCommand(Node):
         self.feedback_pub = self.create_publisher(String, '/teensy/feedback', 10)
         self.create_timer(self.cmd_timeout / 2.0, self.watchdog)
         self.create_timer(READ_PERIOD_S, self.read_serial)
+        self.create_timer(RECONNECT_PERIOD_S, self.reconnect)
         self.get_logger().info(f'Startup lock: motors held at STOP for >= {self.startup_hold}s')
 
     def on_cmd_vel(self, msg):
@@ -73,7 +72,7 @@ class LowLevelCommand(Node):
         now = self.get_clock().now()
         self.last_rx_time = now
         if not self.armed:
-            if abs(v) < 1e-3 and abs(w) < 1e-3 and self.hold_elapsed(now):
+            if abs(v) < 1e-3 and abs(w) < 1e-3 and self.ser is not None and self.hold_elapsed(now):
                 self.arm('received a zero /cmd_vel')
             else:
                 self.get_logger().warn(f'Startup lock: ignoring /cmd_vel (v={v:.2f}, w={w:.2f})',
@@ -92,6 +91,46 @@ class LowLevelCommand(Node):
         self.stopped = False
         self.send(left, right)
 
+    def open_serial(self):
+        self.ser = serial.Serial(self.port, self.baud, timeout=0.1, write_timeout=0.1)
+        try:
+            self.ser.reset_output_buffer()
+            self.ser.reset_input_buffer()
+        except (serial.SerialException, OSError) as exc:
+            self.get_logger().warn(f'Could not flush serial buffers: {exc}')
+        self.get_logger().info(f'Teensy serial open on {self.port}')
+
+    def link_lost(self, exc):
+        self.get_logger().error(
+            f'Teensy link lost ({exc}). The Teensy keeps its last command until its own '
+            f'watchdog stops it. Reconnecting every {RECONNECT_PERIOD_S}s.')
+        try:
+            self.ser.close()
+        except Exception:
+            pass
+        self.ser = None
+        self.probe_link_ok = False
+        self.rx_buf.clear()
+        self.armed = False
+        self.stopped = True
+
+    def reconnect(self):
+        if self.ser is not None:
+            return
+        try:
+            self.open_serial()
+        except (serial.SerialException, OSError) as exc:
+            self.get_logger().warn(f'Teensy still unreachable: {exc}', throttle_duration_sec=5.0)
+            return
+        now = self.get_clock().now()
+        self.armed = False
+        self.stopped = True
+        self.start_time = now
+        self.last_rx_time = now
+        self.send(0.0, 0.0)
+        self.get_logger().warn('Teensy link restored: motors at STOP, startup lock re-applied '
+                               '(re-arms once /cmd_vel is zero or quiet)')
+
     def hold_elapsed(self, now):
         return seconds(now - self.start_time) >= self.startup_hold
 
@@ -106,7 +145,7 @@ class LowLevelCommand(Node):
         if not self.armed:
             self.send(0.0, 0.0)
             quiet = seconds(now - self.last_rx_time)
-            if self.hold_elapsed(now) and quiet > self.cmd_timeout:
+            if self.ser is not None and self.hold_elapsed(now) and quiet > self.cmd_timeout:
                 self.arm(f'/cmd_vel quiet for {quiet:.2f}s')
             return
         elapsed = seconds(now - self.last_cmd_time)
@@ -128,6 +167,7 @@ class LowLevelCommand(Node):
 
     def on_stop_reached(self, msg):
         self.get_logger().info(f"stop_reached ('{msg.data}') — settling {self.probe_settle_delay}s")
+        self.probe_link_ok = self.ser is not None
         self.schedule(self.probe_settle_delay, self.lower_probe)
 
     def lower_probe(self):
@@ -144,6 +184,10 @@ class LowLevelCommand(Node):
 
     def finish_probe_cycle(self):
         self.cancel_probe_timer()
+        if not self.probe_link_ok:
+            self.get_logger().error('Probe cycle not confirmed: the Teensy link was down during '
+                                    'it — confirm the stop in the web UI after checking')
+            return
         if not self.auto_confirm:
             self.get_logger().info('Probe retracted — waiting for the operator')
             return
@@ -151,21 +195,27 @@ class LowLevelCommand(Node):
         self.get_logger().info('Probe retracted — published stop confirmation')
 
     def send(self, left, right):
+        if self.ser is None:
+            return
         line = f'${left:.2f},{right:.2f},{self.probe_up},{self.probe_down}#\n'
         self.get_logger().debug(line)
         try:
             self.ser.write(line.encode('ascii'))
-        except serial.SerialException as exc:
-            self.get_logger().error(f'Serial write failed: {exc}')
+        except serial.SerialTimeoutException as exc:
+            self.get_logger().error(f'Serial write timed out: {exc}', throttle_duration_sec=5.0)
+        except (serial.SerialException, OSError) as exc:
+            self.link_lost(exc)
 
     def read_serial(self):
+        if self.ser is None:
+            return
         try:
             pending = self.ser.in_waiting
             if not pending:
                 return
             self.rx_buf += self.ser.read(pending)
         except (serial.SerialException, OSError) as exc:
-            self.get_logger().error(f'Serial read failed: {exc}', throttle_duration_sec=5.0)
+            self.link_lost(exc)
             return
 
         while (idx := self.rx_buf.find(b'\n')) >= 0:
@@ -184,7 +234,7 @@ class LowLevelCommand(Node):
 
     def close(self):
         try:
-            if self.ser.is_open:
+            if self.ser is not None and self.ser.is_open:
                 self.send(0.0, 0.0)
                 self.ser.flush()
                 self.ser.close()

@@ -48,7 +48,7 @@ class GpsHeadingToImu(Node):
 
         out = Imu()
         out.header.stamp = self.get_clock().now().to_msg()
-        out.header.frame_id = 'gps_heading_link'
+        out.header.frame_id = 'base_footprint'
         out.orientation.z = math.sin(yaw / 2.0)
         out.orientation.w = math.cos(yaw / 2.0)
         out.orientation_covariance = [1e6, 0.0, 0.0, 0.0, 1e6, 0.0, 0.0, 0.0, std * std]

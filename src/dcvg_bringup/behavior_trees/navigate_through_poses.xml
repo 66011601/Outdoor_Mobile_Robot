@@ -4,14 +4,14 @@
       <PipelineSequence name="NavigateWithReplanning">
         <RateController hz="1.5">
           <RecoveryNode number_of_retries="1" name="ComputePathThroughPoses">
-            <ReactiveSequence>
+            <Sequence name="PlanThenSmooth">
               <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="0.8"/>
               <ComputePathThroughPoses goals="{goals}" path="{path}" planner_id="GridBased"/>
               <Fallback name="SmoothOrPassThrough">
                 <SmoothPath unsmoothed_path="{path}" smoothed_path="{path}" smoother_id="simple_smoother"/>
                 <AlwaysSuccess/>
               </Fallback>
-            </ReactiveSequence>
+            </Sequence>
             <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
           </RecoveryNode>
         </RateController>

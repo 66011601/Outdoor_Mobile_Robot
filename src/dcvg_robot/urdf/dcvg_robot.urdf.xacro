@@ -1,6 +1,8 @@
 <?xml version="1.0"?>
 <robot name="dcvg_robot" xmlns:xacro="http://www.ros.org/wiki/xacro">
 
+  <xacro:arg name="use_imu_tilt" default="false"/>
+
   <xacro:property name="base_height" value="0.08"/>
   <xacro:property name="wheel_x" value="-0.12705949983365117"/>
   <xacro:property name="wheel_z" value="0.10252579476793128"/>
@@ -38,11 +40,31 @@
 
   <link name="base_footprint"/>
 
-  <joint name="base_joint" type="fixed">
-    <parent link="base_footprint"/>
-    <child link="base_link"/>
-    <origin xyz="0 0 ${base_height}" rpy="0 0 0"/>
-  </joint>
+  <xacro:if value="$(arg use_imu_tilt)">
+    <link name="base_pitch_link"/>
+
+    <joint name="base_pitch_joint" type="continuous">
+      <parent link="base_footprint"/>
+      <child link="base_pitch_link"/>
+      <origin xyz="0 0 ${base_height}" rpy="0 0 0"/>
+      <axis xyz="0 1 0"/>
+    </joint>
+
+    <joint name="base_roll_joint" type="continuous">
+      <parent link="base_pitch_link"/>
+      <child link="base_link"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <axis xyz="1 0 0"/>
+    </joint>
+  </xacro:if>
+
+  <xacro:unless value="$(arg use_imu_tilt)">
+    <joint name="base_joint" type="fixed">
+      <parent link="base_footprint"/>
+      <child link="base_link"/>
+      <origin xyz="0 0 ${base_height}" rpy="0 0 0"/>
+    </joint>
+  </xacro:unless>
 
   <link name="base_link">
     <visual>
@@ -69,8 +91,8 @@
   <xacro:wheel name="right_caster_front" x="${caster_x}" y="${right_y}" z="${caster_z}" radius="0.085"/>
   <xacro:wheel name="left_caster_front" x="${caster_x}" y="${left_y}" z="${caster_z}" radius="0.085"/>
 
-  <xacro:frame name="camera_link" x="0.52" y="0" z="0.62"/>
-  <xacro:frame name="gps_link" x="-0.60" y="0.0" z="0.92"/>
-  <xacro:frame name="gps_heading_link" x="0.60" y="0.0" z="0.92"/>
+  <xacro:frame name="camera_link" x="0.62" y="0" z="0.82"/>
+  <xacro:frame name="gps_link" x="-0.62" y="0.0" z="1.15"/>
+  <xacro:frame name="gps_heading_link" x="0.62" y="0.0" z="1.15"/>
 
 </robot>

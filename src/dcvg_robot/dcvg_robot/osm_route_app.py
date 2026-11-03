@@ -2,6 +2,7 @@ import collections
 import math
 import re
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -26,11 +27,13 @@ PORT = int(os.environ.get('DCVG_PORT', '5010'))
 MANUAL_SERVICE = 'dcvg.service'
 DEFAULT_CAMERA_TOPIC = '/camera/color/image_raw'
 BRINGUP_GRACE_S = 30.0
+BRINGUP_STOP_TIMEOUT_S = 20.0
 TELEOP_DEADMAN_S = 0.5
 STALL_LIN = 0.03
 STALL_ANG = 0.05
 STALL_TIMEOUT_S = 7.0
 STALL_GRACE_S = 6.0
+MOTOR_LINK_TIMEOUT_S = 1.0
 WAYPOINT_SANITY_RADIUS_M = 2000.0
 CHECK_FRESH_S = 3.0
 CHECK_NO_DATA_S = 20.0
@@ -47,7 +50,8 @@ BRINGUP_CHECKS = [
     {'key': 'motors', 'label': 'Motor controller', 'procs': ['low_level_command'],
      'topic': '/teensy/feedback'},
     {'key': 'vo', 'label': 'Visual odometry', 'procs': ['stereo_odometry', 'rgbd_odometry',
-                                                        'obstacles_detection'], 'topic': '/vo'},
+                                                        'obstacles_detection', 'terrain_filter'],
+     'topic': '/vo'},
     {'key': 'localization', 'label': 'Localization',
      'procs': ['ekf_node', 'navsat_transform_node'], 'topic': '/odometry/local'},
     {'key': 'gps', 'label': 'GPS position', 'procs': ['ublox_gps_node'], 'topic': '/gps/fix'},
@@ -76,7 +80,7 @@ gps_fix = {'status': None}
 robot_pose = {'available': False, 'lat': 0.0, 'lon': 0.0, 'heading': 0.0, 'lin': 0.0, 'ang': 0.0}
 camera = {'jpeg': None, 'ts': 0.0, 'want_ts': 0.0, 'topic': DEFAULT_CAMERA_TOPIC}
 teleop = {'active': False, 'lin': 0.0, 'ang': 0.0, 'ts': 0.0, 'disengage_at': 0.0}
-stall = {'since': None, 'notified': False, 'grace_until': 0.0}
+stall = {'since': None, 'notified': False, 'grace_until': 0.0, 'link_notified': False}
 nav_alert = {'active': False, 'message': ''}
 ros = {'cmd_pub': None}
 
@@ -118,7 +122,8 @@ def start_bringup():
     topic_seen.clear()
     gps_fix['status'] = None
     proc = subprocess.Popen(['ros2', 'launch', 'dcvg_bringup', 'bringup.launch.py'],
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            start_new_session=True)
     bringup.update(proc=proc, state='starting', started_ts=time.monotonic())
 
     def reader():
@@ -188,20 +193,31 @@ def refresh_bringup_state():
                 and time.monotonic() - bringup['started_ts'] >= BRINGUP_GRACE_S):
             bringup['state'] = 'running'
     else:
+        signal_group(proc, signal.SIGKILL)
         bringup['proc'] = None
         if bringup['state'] != 'stopped':
             bringup['state'] = 'failed'
 
 
+def signal_group(proc, sig):
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
 def stop_bringup():
     proc = bringup['proc']
     bringup['state'] = 'stopped'
-    if proc and proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+    if proc:
+        if proc.poll() is None:
+            signal_group(proc, signal.SIGINT)
+            try:
+                proc.wait(timeout=BRINGUP_STOP_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                pass
+        signal_group(proc, signal.SIGKILL)
+        proc.wait()
     bringup['proc'] = None
 
 
@@ -257,9 +273,20 @@ def teleop_tick():
 
 def stall_tick():
     if nav['state'] != 'running':
-        stall.update(since=None, notified=False)
+        stall.update(since=None, notified=False, link_notified=False)
         return
     now = time.monotonic()
+    link_age = now - topic_seen.get('/teensy/feedback', 0.0)
+    if link_age > MOTOR_LINK_TIMEOUT_S and not stall['link_notified']:
+        write_cmd('pause')
+        nav['state'] = 'paused'
+        nav_alert.update(active=True, message=(
+            f"Motor controller link lost (no Teensy feedback for {link_age:.1f}s). "
+            "The robot may keep driving on its last command — use the kill switch now. "
+            "Navigation auto-paused."))
+        stall['link_notified'] = True
+        print('[osm_route_app] MOTOR LINK LOST → auto-paused navigation')
+        return
     if now < stall['grace_until'] or read_file(STOP_STATUS_FILE):
         stall['since'] = None
         return

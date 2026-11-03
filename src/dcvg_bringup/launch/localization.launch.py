@@ -11,11 +11,6 @@ def generate_launch_description():
 
     return LaunchDescription([
         Node(
-            package='dcvg_bringup',
-            executable='imu_throttle',
-            output='screen',
-        ),
-        Node(
             package='robot_localization',
             executable='ekf_node',
             name='ekf_filter_node_odom',

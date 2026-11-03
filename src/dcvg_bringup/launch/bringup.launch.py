@@ -58,6 +58,12 @@ def generate_launch_description():
         DeclareLaunchArgument('use_telemetry', default_value='True'),
         DeclareLaunchArgument('enable_ocr', default_value='True'),
         DeclareLaunchArgument('heading_offset_deg', default_value='0.0'),
+        DeclareLaunchArgument('use_imu_tilt', default_value='False'),
+        DeclareLaunchArgument('max_ground_angle', default_value='50.0'),
+        DeclareLaunchArgument('max_ground_height', default_value='0.0'),
+        DeclareLaunchArgument('use_terrain_filter', default_value='True'),
+        DeclareLaunchArgument('grass_height', default_value='0.12'),
+        DeclareLaunchArgument('step_height', default_value='0.20'),
         DeclareLaunchArgument('teensy_port', default_value='/dev/ttyTeensy'),
         DeclareLaunchArgument('gps_device', default_value='/dev/ttyGPS_movingbase'),
         DeclareLaunchArgument('gps_heading_device', default_value='/dev/ttyGPS_rover'),
@@ -66,11 +72,12 @@ def generate_launch_description():
             package='robot_state_publisher',
             executable='robot_state_publisher',
             output='both',
-            parameters=[{'robot_description': ParameterValue(Command(['xacro ', xacro_file]),
-                                                             value_type=str)}],
+            parameters=[{'robot_description': ParameterValue(
+                Command(['xacro ', xacro_file, ' use_imu_tilt:=', arg('use_imu_tilt')]),
+                value_type=str)}],
         ),
 
-        after('sensors', include('sensors.launch.py')),
+        after('sensors', include('sensors.launch.py', {'use_imu_tilt': arg('use_imu_tilt')})),
 
         after('motors', Node(
             package='dcvg_bringup',
@@ -81,7 +88,14 @@ def generate_launch_description():
 
         after('localization', include('localization.launch.py')),
 
-        after('rtabmap', include('rtabmap.launch.py', {'use_stereo': arg('use_stereo')})),
+        after('rtabmap', include('rtabmap.launch.py', {
+            'use_stereo': arg('use_stereo'),
+            'max_ground_angle': arg('max_ground_angle'),
+            'max_ground_height': arg('max_ground_height'),
+            'use_terrain_filter': arg('use_terrain_filter'),
+            'grass_height': arg('grass_height'),
+            'step_height': arg('step_height'),
+        })),
 
         after('gps', include('ublox_gps.launch.py', {
             'device': arg('gps_device'),

@@ -1,0 +1,4 @@
+/tf_static:
+  history: keep_all
+  reliability: reliable
+  durability: transient_local
