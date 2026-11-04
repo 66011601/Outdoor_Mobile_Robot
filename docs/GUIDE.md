@@ -34,7 +34,7 @@
 | 3 | `src/dcvg_bringup/dcvg_bringup/low_level_command.py` | ทางออกจาก ROS ไปยัง motor และ probe |
 | 4 | `src/dcvg_bringup/config/nav2_params.yaml` และ `localization.yaml` | ค่าที่มีผลต่อการวิ่งมากที่สุด |
 | 5 | `src/dcvg_robot/dcvg_robot/osm_route_app.py` | Web app และการตรวจสถานะระบบ |
-| 6 | Firmware `DCVG_Robot2_R1_Teensy.ino` (อยู่นอก repo) | สิ่งที่เกิดจริงหลังจากคำสั่งออกจาก ROS |
+| 6 | Firmware `teensy/DCVG_Robot2_R1_Teensy.ino` | สิ่งที่เกิดจริงหลังจากคำสั่งออกจาก ROS |
 
 **ข้อตกลงของ project**
 
@@ -88,7 +88,6 @@
 
 | รายการ | ตำแหน่ง | ใช้ทำอะไร |
 |---|---|---|
-| Firmware Teensy | Folder `DCVG_Robot2_R1_Teensy/` บน laptop ของผู้พัฒนาเดิม | ควบคุมล้อและ probe |
 | Manual mode program | `~/Desktop/DCVG_Robot` บน Jetson ผ่าน `dcvg.service` | Manual mode ใน web app |
 | Udev rules | `/etc/udev/rules.d/99-usb-serial.rules` | สร้างชื่อ `/dev/ttyTeensy`, `/dev/ttyGPS_*` |
 | Sudoers rule | `/etc/sudoers.d/` | สลับ mode และปิดเครื่องจาก web |
@@ -132,6 +131,7 @@ repo root = รากของ colcon workspace (~/dcvg_robot)
 ├── README.md, CLAUDE.md
 ├── docs/                      เอกสารชุดนี้
 ├── cache/                     cache OpenStreetMap ที่ osmnx สร้าง (ไม่ใช่ source code)
+├── teensy/                    Firmware ของ Teensy
 └── src/
     ├── dcvg_bringup/          ระบบที่ run บน hardware จริง
     ├── dcvg_robot/            model หุ่นยนต์และเครื่องมือของ operator
@@ -405,7 +405,9 @@ Node นี้วัดความสูงเทียบกับพื้น
 
 ## 9. Firmware ของ Teensy
 
-> Source code อยู่นอก repo ข้อมูลในหัวข้อนี้มาจาก file `DCVG_Robot2_R1_Teensy.ino` ควรเทียบว่าตรงกับที่ flash อยู่บนหุ่นจริงก่อนอ้างอิง
+> Source code อยู่ที่ `teensy/DCVG_Robot2_R1_Teensy.ino` ควรยืนยันว่าตรงกับที่ flash อยู่บนหุ่นจริงก่อนอ้างอิง
+>
+> Arduino IDE ต้องการให้ชื่อ folder ตรงกับชื่อ file `.ino` ก่อน compile ให้คัดลอก file ไปไว้ใน folder ชื่อ `DCVG_Robot2_R1_Teensy/` หรือให้ IDE สร้าง folder นี้ให้
 
 ### Serial protocol (115200 baud)
 
@@ -644,7 +646,7 @@ Topic ที่ควรดูเป็นอันดับแรก: `/odometr
 
 | รายการ | สถานะ | สิ่งที่ต้องทำ |
 |---|---|---|
-| source firmware | อยู่นอก repo | รับ file จากผู้พัฒนาเดิม เทียบกับที่ flash บนหุ่น แล้วเก็บเข้า version control |
+| Firmware ที่ flash อยู่บนหุ่น | ยังไม่ได้ยืนยัน | ยืนยันว่า `teensy/DCVG_Robot2_R1_Teensy.ino` คือ version ที่ flash อยู่ และบันทึกรุ่นของ Teensy |
 | Manual mode program (`~/Desktop/DCVG_Robot`, `dcvg.service`) | อยู่บน Jetson เท่านั้น | สำรอง file และเก็บเข้า version control |
 | Udev rules และ sudoers | อยู่บน Jetson เท่านั้น | สำรอง file ไว้เป็นตัวอย่าง |
 | วิธีติดตั้ง package บน Jetson | ยังไม่ได้บันทึก | บันทึกว่า package ใดมาจาก apt หรือ build เอง โดยเฉพาะ RealSense, u-blox, ntrip_client |

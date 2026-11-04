@@ -528,7 +528,7 @@ Web app เรียกโดยไม่ส่ง parameter ถ้าจะเ�
 
 ## 13. Firmware ของ Teensy
 
-ค่าอยู่ใน `DCVG_Robot2_R1_Teensy.ino` หลังแก้ต้อง flash ใหม่ และควรทดสอบแบบยกล้อก่อนเสมอ
+ค่าอยู่ใน `teensy/DCVG_Robot2_R1_Teensy.ino` หลังแก้ต้อง flash ใหม่ และควรทดสอบแบบยกล้อก่อนเสมอ
 
 ### PID และ feedforward
 
